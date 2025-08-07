@@ -564,7 +564,7 @@ if(CIRCT_SLANG_FRONTEND_ENABLED)
     FetchContent_Declare(
       slang
       GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-      GIT_TAG v8.0
+      GIT_TAG v8.1
       GIT_SHALLOW ON)
     set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE "NEVER")
 
