@@ -565,7 +565,7 @@ if(CIRCT_SLANG_FRONTEND_ENABLED)
       slang
       #GIT_REPOSITORY git@github.com:MikePopoloski/slang.git
       GIT_REPOSITORY https://gitee.com/mirrors_MikePopoloski/slang.git
-      GIT_TAG v8.0
+      GIT_TAG v8.1
       GIT_SHALLOW ON)
     set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE "NEVER")
 
