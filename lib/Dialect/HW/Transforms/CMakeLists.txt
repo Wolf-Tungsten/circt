@@ -8,6 +8,7 @@ add_circt_dialect_library(CIRCTHWTransforms
   FlattenModules.cpp
   FooWires.cpp
   HWPartition.cpp
+  HWExportCoveGraph.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen

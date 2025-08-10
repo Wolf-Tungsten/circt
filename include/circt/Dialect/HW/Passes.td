@@ -106,4 +106,15 @@ def HWPartition : Pass<"hw-partition", "mlir::ModuleOp"> {
   ];
 }
 
+def HWExportCoveGraph : Pass<"hw-export-cove-graph", "mlir::ModuleOp"> {
+  let summary = "Export the cove graph in JSON format";
+  let description = [{
+    This pass extract the logical coves in design and dump them in JSON format.
+  }];
+  let options = [
+    Option<"outputJSONPath", "output-json-path", "std::string", "\"cove-graph.json\"",
+      "Output JSON Path">,
+  ];
+  let dependentDialects = ["comb::CombDialect", "seq::SeqDialect"];
+}
 #endif // CIRCT_DIALECT_HW_PASSES_TD
