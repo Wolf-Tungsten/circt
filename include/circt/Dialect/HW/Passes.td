@@ -92,4 +92,18 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let dependentDialects = ["comb::CombDialect"];
 }
 
+def HWPartition : Pass<"hw-partition", "mlir::ModuleOp"> {
+  let summary = "Partition a module into multiple submodules";
+  let description = [{
+    This pass partitions a module into multiple submodules based on the
+    `hw.partition` attribute. The partitioning is done by creating new
+    `hw.module` operations for each partition and moving the relevant
+    operations into these new modules.
+  }];
+  let options = [
+    Option<"n", "number-of-partition", "int", "4",
+      "Number of Partition.">,
+  ];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD

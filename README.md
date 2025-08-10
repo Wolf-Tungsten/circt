@@ -111,7 +111,8 @@ $ cmake -G Ninja .. \
     -DLLVM_DIR=$PWD/../llvm/build/lib/cmake/llvm \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DCMAKE_BUILD_TYPE=DEBUG \
-    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DCIRCT_SLANG_FRONTEND_ENABLED=ON 
 $ ninja
 $ ninja check-circt
 $ ninja check-circt-integration # Run the integration tests.
