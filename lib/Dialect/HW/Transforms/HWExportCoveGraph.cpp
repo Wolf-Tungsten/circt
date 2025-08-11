@@ -49,12 +49,16 @@ struct HWExportCoveGraph {
   }
 
   std::unordered_map<std::string, Operation *> labelStateOpMap;
-  std::unordered_map<Operation *, uint64_t> statelessOpIdMap;
+  std::unordered_map<Operation *, std::string> statelessOpIdMap;
   int statelessOpIdCounter = 0;
 
   void collectOps(circt::hw::HWModuleOp module) {
 
     module.walk([&](Operation *op) {
+      if (op == module) {
+        // 跳过模块本身
+        return;
+      }
       if (isa<seq::CompRegOp>(op) || isa<seq::CompRegClockEnabledOp>(op) ||
           isa<seq::FirRegOp>(op)) {
         // 检查 `name` 属性是否为空
@@ -98,13 +102,15 @@ struct HWExportCoveGraph {
       } else {
         // stateless op
         if (statelessOpIdMap.count(op) == 0) {
-          statelessOpIdMap[op] = statelessOpIdCounter++;
+          std::string label = op->getName().getStringRef().str();
+          label = labelGuard(label);
+          statelessOpIdMap[op] = label;
         }
       }
     });
   }
 
-  llvm::DenseMap<llvm::StringRef, llvm::SmallPtrSet<Operation *, 8>> coveMap;
+  std::unordered_map<std::string, llvm::SmallPtrSet<Operation *, 8>> coveMap;
 
   bool isStopOp(Operation *op) {
     // 检查操作是否是状态操作
@@ -128,7 +134,8 @@ struct HWExportCoveGraph {
         return;
       }
       Operation *defOp = v.getDefiningOp();
-      if (defOp && !isStopOp(defOp) && coveSet.insert(defOp).second) {
+      if (defOp && !isStopOp(defOp) && !coveSet.contains(defOp)) {
+        coveSet.insert(defOp);
         worklist.push_back(defOp);
       }
     };
@@ -144,6 +151,7 @@ struct HWExportCoveGraph {
     } else if (auto firReg = dyn_cast<seq::FirRegOp>(op)) {
       // next
       tryUpdateCoveAndWorklist(firReg.getNext());
+      tryUpdateCoveAndWorklist(firReg.getReset());
     } else if (auto firMemWrite = dyn_cast<seq::FirMemWriteOp>(op)) {
       tryUpdateCoveAndWorklist(firMemWrite.getData());
       tryUpdateCoveAndWorklist(firMemWrite.getAddress());
@@ -171,6 +179,17 @@ struct HWExportCoveGraph {
     return success();
   }
 
+  void printCove() {
+    for (const auto &pair : coveMap) {
+      llvm::outs() << "Cove for state op label: " << pair.first << "\n";
+      for (Operation *op : pair.second) {
+        llvm::outs() << "  Op ID: " << statelessOpIdMap[op] << ", Op: ";
+        op->print(llvm::outs());
+        llvm::outs() << "\n";
+      }
+    }
+  }
+
   void dumpJson() {
     std::error_code ec;
     llvm::raw_fd_ostream raw_os(outputJSONPath, ec, llvm::sys::fs::OF_Text);
@@ -181,34 +200,38 @@ struct HWExportCoveGraph {
     llvm::json::OStream os(raw_os, 2);
     os.object([&] {
       os.attributeObject("coveMap", [&] {
-        os.object([&] {
-          for (const auto &pair : coveMap) {
-            os.attributeArray(pair.first, [&] {
-              os.array([&] {
-                for (Operation *op : pair.second) {
-                  // 输出操作的 ID
-                  os.value(std::to_string(statelessOpIdMap[op]));
-                }
-              });
-            });
-          }
-        });
+        for (const auto &pair : coveMap) {
+          os.attributeArray(pair.first, [&] {
+            for (Operation *op : pair.second) {
+              // 输出操作的 ID
+              os.value(statelessOpIdMap[op]);
+            }
+          });
+        }
       });
-      os.attributeObject("statelessOpInfo", [&] {
-        os.object([&] {
-          for (const auto &pair : statelessOpIdMap) {
-            os.attribute(std::to_string(pair.second),
-                         pair.first->getName().getStringRef());
-          }
-        });
+      os.attributeObject("statelessOp", [&] {
+        for (const auto &pair : statelessOpIdMap) {
+          os.attribute(pair.second, pair.first->getName().getStringRef());
+        }
+      });
+      os.attributeObject("statefulOp", [&] {
+        for (const auto &pair : labelStateOpMap) {
+          os.attribute(pair.first, pair.second->getName().getStringRef());
+        }
       });
     });
   }
   LogicalResult run(hw::HWModuleOp topModule) {
+    llvm::dbgs() << "Running HWExportCoveGraph on module: "
+                 << topModule.getName() << "\n";
     collectOps(topModule);
+    llvm::dbgs() << "Collected " << labelStateOpMap.size()
+                 << " stateful operations and " << statelessOpIdMap.size()
+                 << " stateless operations.\n";
     // 遍历所有的状态操作
     for (auto [label, op] : labelStateOpMap) {
       // 处理逻辑锥
+      llvm::dbgs() << "Processing logic cove for label: " << label << "\n";
       if (failed(pickLogicCove(label))) {
         llvm::errs() << "Failed to pick logic cove for label: " << label
                      << "\n";
