@@ -5,8 +5,11 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
+#include <deque>
 
 #define DEBUG_TYPE "hw-export-cove-graph"
 
@@ -23,103 +26,201 @@ using namespace mlir;
 
 namespace {
 struct HWExportCoveGraph {
+
+  std::string outputJSONPath;
   /// The number of partitions to create.
-  // llvm::DenseMap<llvm::SmallString<0>, int> seenLabelCount;
+  std::unordered_map<std::string, int> seenLabelCount;
 
-  // std::string labelGuard(llvm::StringRef expectLabel) {
-  //   auto search = seenLabelCount.find(expectLabel);
-  //   if (search != seenLabelCount.end()) {
-  //     // Label exists, increment the count and append suffix
-  //     int count = search->second;
-  //     llvm::Twine newLabel = expectLabel + "_" + llvm::Twine(count);
-  //     seenLabelCount[expectLabel] = count + 1;
-  //     // Also record the newLabel entry
-  //     seenLabelCount[newLabel] = 1;
-  //     return newLabel;
-  //   } else {
-  //     // Label is new, just add it to the map with initial count
-  //     seenLabelCount[expectLabel] = 1;
-  //     return expectLabel;
-  //   }
-  // }
+  std::string labelGuard(std::string expectLabel) {
+    auto search = seenLabelCount.find(expectLabel);
+    if (search != seenLabelCount.end()) {
+      // Label exists, increment the count and append suffix
+      int count = search->second;
+      std::string newLabel = expectLabel + "_" + std::to_string(count);
+      seenLabelCount[expectLabel] = count + 1;
+      // Also record the newLabel entry
+      seenLabelCount[newLabel] = 1;
+      return newLabel;
+    } else {
+      // Label is new, just add it to the map with initial count
+      seenLabelCount[expectLabel] = 1;
+      return expectLabel;
+    }
+  }
 
-  // llvm::DenseMap<std::string, Operation *> labelOpMap;
+  std::unordered_map<std::string, Operation *> labelStateOpMap;
+  std::unordered_map<Operation *, uint64_t> statelessOpIdMap;
+  int statelessOpIdCounter = 0;
 
-  // LogicalResult collectStateOps(circt::hw::HWModuleOp module) {
+  void collectOps(circt::hw::HWModuleOp module) {
 
-  //   module.walk([&](Operation *op) {
-  //     if (isa<seq::CompRegOp>(op) || isa<seq::CompRegClockEnabledOp>(op) ||
-  //         isa<seq::FirRegOp>(op)) {
-  //       // 检查 `name` 属性是否为空
-  //       StringAttr nameAttr = op->getAttrOfType<StringAttr>("name");
-  //       if (!nameAttr || nameAttr.getValue().empty()) {
-  //         // 设置初始名称为 `anonymous_firreg`
-  //         std::string newName = "anonymous_firreg";
-  //         // 使用 labelGuard 来获得一个安全的 label
-  //         std::string safeLabel = labelGuard(newName);
-  //         // 将安全的 label 设置到 `name` 属性上
-  //         op->setAttr("name", StringAttr::get(op->getContext(), safeLabel));
-  //         // 将操作指针插入到 `labelOpMap` 中
-  //         labelOpMap[safeLabel] = op;
-  //       } else {
-  //         // 如果已有名称，也可以根据需要使用 `labelGuard`
-  //         std::string existingName = nameAttr.getValue().str();
-  //         std::string safeLabel = labelGuard(existingName);
-  //         if (safeLabel != existingName) {
-  //           op->setAttr("name", StringAttr::get(op->getContext(),
-  //           safeLabel));
-  //         }
-  //         labelOpMap[safeLabel] = op;
-  //       }
-  //     } else if (isa<seq::FirMemWriteOp>(op) ||
-  //                isa<seq::FirMemReadWriteOp>(op)) {
-  //       // 获取 op 的第一个操作数，找这个 value 的 def op，必须是 firmem
-  //       // 类型的 memOp， 获取 memOp 的 name 属性
-  //       Value memoryOperand = op->getOperand(0);
-  //       Operation *memOp = memoryOperand.getDefiningOp();
-  //     }
-  //   });
-  // }
+    module.walk([&](Operation *op) {
+      if (isa<seq::CompRegOp>(op) || isa<seq::CompRegClockEnabledOp>(op) ||
+          isa<seq::FirRegOp>(op)) {
+        // 检查 `name` 属性是否为空
+        StringAttr nameAttr = op->getAttrOfType<StringAttr>("name");
+        if (!nameAttr || nameAttr.getValue().empty()) {
+          // 设置初始名称为 `anonymous_firreg`
+          std::string newName = "anonymous_firreg";
+          // 使用 labelGuard 来获得一个安全的 label
+          std::string safeLabel = labelGuard(newName);
+          // 将安全的 label 设置到 `name` 属性上
+          op->setAttr("name", StringAttr::get(op->getContext(), safeLabel));
+          // 将操作指针插入到 `labelOpMap` 中
+          labelStateOpMap[safeLabel] = op;
+        } else {
+          // 如果已有名称，也可以根据需要使用 `labelGuard`
+          std::string existingName = nameAttr.getValue().str();
+          std::string safeLabel = labelGuard(existingName);
+          if (safeLabel != existingName) {
+            op->setAttr("name", StringAttr::get(op->getContext(), safeLabel));
+          }
+          labelStateOpMap[safeLabel] = op;
+        }
+      } else if (isa<seq::FirMemWriteOp>(op) ||
+                 isa<seq::FirMemReadWriteOp>(op)) {
+        // 获取 op 的第一个操作数，找这个 value 的 def op，必须是 firmem
+        // 类型的 memOp， 获取 memOp 的 name 属性
+        Value memoryOperand = op->getOperand(0);
+        Operation *memOp = memoryOperand.getDefiningOp();
+        llvm::StringRef memName =
+            memOp->getAttrOfType<StringAttr>("name").getValue();
+        if (memName.empty()) {
+          // 如果没有名称，设置一个默认名称
+          std::string newMemName = "anonymous_firmem";
+          newMemName = labelGuard(newMemName);
+          memOp->setAttr("name", StringAttr::get(op->getContext(), newMemName));
+          memName = memOp->getAttrOfType<StringAttr>("name").getValue();
+        }
+        std::string portName = memName.str() + "_port";
+        portName = labelGuard(portName);
+        labelStateOpMap[portName] = op;
+      } else {
+        // stateless op
+        if (statelessOpIdMap.count(op) == 0) {
+          statelessOpIdMap[op] = statelessOpIdCounter++;
+        }
+      }
+    });
+  }
 
-  // /// Run the partitioning pass on the given module.
-  // LogicalResult run(ModuleOp circuit) {
-  //   MLIRContext *ctx = circuit->getContext();
-  //   llvm::outs() << "Defined Symbols in the Module:\n";
-  //   // 直接遍历模块中的操作
-  //   circuit.walk([](Operation *op) {
-  //     // 判断操作是否实现了 SymbolOpInterface
-  //     if (auto symbolOp = dyn_cast<SymbolOpInterface>(op)) {
-  //       // 获取符号名称
-  //       StringRef symbolName = symbolOp.getName();
-  //       llvm::outs() << "- " << symbolName << "\n";
-  //     }
-  //   });
+  llvm::DenseMap<llvm::StringRef, llvm::SmallPtrSet<Operation *, 8>> coveMap;
 
-  //   circuit.walk([&](circt::hw::HWModuleOp mod) {
-  //     llvm::outs() << "=== Module: " << mod.getName() << "\n";
-  //     int id = 0;
-  //     mod.walk([&](mlir::Operation *op) {
-  //       // firreg
-  //       if (auto fir = llvm::dyn_cast<circt::seq::FirRegOp>(op)) {
-  //         std::string new_reg_name = "grh_reg_" + std::to_string(id++);
-  //         llvm::outs()
-  //             << "  firreg  : " << fir.getResult().getType() << " "
-  //             << fir->getAttrOfType<mlir::StringAttr>("name").getValue()
-  //             << "\n";
-  //         // fir->setAttr("name", StringAttr::get(ctx, new_reg_name));
-  //       }
-  //       // compreg
-  //       if (auto comp = llvm::dyn_cast<circt::seq::CompRegOp>(op)) {
-  //         llvm::outs()
-  //             << "  compreg : " << comp.getResult().getType() << " "
-  //             << comp->getAttrOfType<mlir::StringAttr>("name").getValue()
-  //             << "\n";
-  //       }
-  //     });
-  //   });
-  //   // LLVM_DEBUG(llvm::dbgs() << "User Request Partition:" << n << "\n");
-  //   return success();
-  // }
+  bool isStopOp(Operation *op) {
+    // 检查操作是否是状态操作
+    return isa<seq::CompRegOp>(op) || isa<seq::CompRegClockEnabledOp>(op) ||
+           isa<seq::FirRegOp>(op) || isa<seq::FirMemReadOp>(op) ||
+           isa<seq::FirMemReadWriteOp>(op) || isa<hw::ConstantOp>(op);
+  }
+
+  LogicalResult pickLogicCove(const std::string &stateOplabel) {
+    if (labelStateOpMap.count(stateOplabel) == 0) {
+      llvm::errs() << "Error: No operation found for label: " << stateOplabel
+                   << "\n";
+      return failure();
+    }
+    Operation *op = labelStateOpMap[stateOplabel];
+    // BFS 遍历产生逻辑锥
+    llvm::SmallPtrSet<Operation *, 8> coveSet;
+    std::deque<Operation *> worklist;
+    auto tryUpdateCoveAndWorklist = [&](Value v) {
+      if (!v) {
+        return;
+      }
+      Operation *defOp = v.getDefiningOp();
+      if (defOp && !isStopOp(defOp) && coveSet.insert(defOp).second) {
+        worklist.push_back(defOp);
+      }
+    };
+    // 初始化装载
+    if (auto compReg = dyn_cast<seq::CompRegOp>(op)) {
+      // input
+      tryUpdateCoveAndWorklist(compReg.getInput());
+    } else if (auto compRegCe = dyn_cast<seq::CompRegClockEnabledOp>(op)) {
+      // input
+      tryUpdateCoveAndWorklist(compRegCe.getInput());
+      // 处理时钟使能信号
+      tryUpdateCoveAndWorklist(compRegCe.getClockEnable());
+    } else if (auto firReg = dyn_cast<seq::FirRegOp>(op)) {
+      // next
+      tryUpdateCoveAndWorklist(firReg.getNext());
+    } else if (auto firMemWrite = dyn_cast<seq::FirMemWriteOp>(op)) {
+      tryUpdateCoveAndWorklist(firMemWrite.getData());
+      tryUpdateCoveAndWorklist(firMemWrite.getAddress());
+      tryUpdateCoveAndWorklist(firMemWrite.getMask());
+      tryUpdateCoveAndWorklist(firMemWrite.getEnable());
+    } else if (auto firMemReadWrite = dyn_cast<seq::FirMemReadWriteOp>(op)) {
+      tryUpdateCoveAndWorklist(firMemReadWrite.getWriteData());
+      tryUpdateCoveAndWorklist(firMemReadWrite.getAddress());
+      tryUpdateCoveAndWorklist(firMemReadWrite.getMask());
+      tryUpdateCoveAndWorklist(firMemReadWrite.getEnable());
+      tryUpdateCoveAndWorklist(firMemReadWrite.getMode());
+    } else {
+      return failure();
+    }
+    while (!worklist.empty()) {
+      Operation *currentOp = worklist.front();
+      worklist.pop_front();
+      // 遍历 currentOp 的所有操作数
+      for (Value operand : currentOp->getOperands()) {
+        tryUpdateCoveAndWorklist(operand);
+      }
+    }
+    // 将 coveSet 添加到 coveMap 中
+    coveMap[stateOplabel] = coveSet;
+    return success();
+  }
+
+  void dumpJson() {
+    std::error_code ec;
+    llvm::raw_fd_ostream raw_os(outputJSONPath, ec, llvm::sys::fs::OF_Text);
+    if (ec) {
+      llvm::errs() << "Cannot open file: " << ec.message() << "\n";
+      return;
+    }
+    llvm::json::OStream os(raw_os, 2);
+    os.object([&] {
+      os.attributeObject("coveMap", [&] {
+        os.object([&] {
+          for (const auto &pair : coveMap) {
+            os.attributeArray(pair.first, [&] {
+              os.array([&] {
+                for (Operation *op : pair.second) {
+                  // 输出操作的 ID
+                  os.value(std::to_string(statelessOpIdMap[op]));
+                }
+              });
+            });
+          }
+        });
+      });
+      os.attributeObject("statelessOpInfo", [&] {
+        os.object([&] {
+          for (const auto &pair : statelessOpIdMap) {
+            os.attribute(std::to_string(pair.second),
+                         pair.first->getName().getStringRef());
+          }
+        });
+      });
+    });
+  }
+  LogicalResult run(hw::HWModuleOp topModule) {
+    collectOps(topModule);
+    // 遍历所有的状态操作
+    for (auto [label, op] : labelStateOpMap) {
+      // 处理逻辑锥
+      if (failed(pickLogicCove(label))) {
+        llvm::errs() << "Failed to pick logic cove for label: " << label
+                     << "\n";
+        return failure();
+      }
+    }
+    // 输出 JSON 文件
+    if (!outputJSONPath.empty()) {
+      dumpJson();
+    }
+    return success();
+  }
 };
 } // namespace
 
@@ -135,7 +236,12 @@ struct HWExportCoveGraphPass
 void HWExportCoveGraphPass::runOnOperation() {
 
   HWExportCoveGraph exporter;
-
+  exporter.outputJSONPath = outputJSONPath;
+  getOperation()->walk([&](hw::HWModuleOp module) {
+    if (failed(exporter.run(module))) {
+      signalPassFailure();
+    }
+  });
   // if (failed(exporter.run(getOperation())))
   //   signalPassFailure();
 }
