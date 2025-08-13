@@ -39,4 +39,14 @@ def LowerConcatRef : Pass<"moore-lower-concatref", "moore::SVModuleOp"> {
     let constructor = "circt::moore::createLowerConcatRefPass()";
 }
 
+def IsolateDisplay : Pass<"moore-isolate-display", "mlir::ModuleOp"> {
+    let summary = "Isolate display statements";
+    let description = [{
+      This pass isolates display statements from the rest of the module.
+      It is useful for debugging and analysis purposes, allowing the display
+      statements to be processed independently.
+    }];
+    let constructor = "circt::moore::createIsolateDisplayPass()";
+}
+
 #endif // CIRCT_DIALECT_MOORE_MOOREPASSES_TD
