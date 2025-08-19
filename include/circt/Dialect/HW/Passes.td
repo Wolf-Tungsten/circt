@@ -92,4 +92,12 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let dependentDialects = ["comb::CombDialect"];
 }
 
+def HWStatistics : Pass<"hw-statistics", "mlir::ModuleOp"> {
+  let summary = "Prints statistics about the HW module";
+  let description = [{
+    This pass prints statistics about the HW module, such as the number of
+    instances, wires, and other elements.
+  }];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD
