@@ -92,4 +92,11 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let dependentDialects = ["comb::CombDialect"];
 }
 
+def HWEliminateHierPath : Pass<"hw-eliminate-hierpath", "mlir::ModuleOp"> {
+  let summary = "Eliminate hw.hierpath operations";
+  let description = [{
+    This pass eliminates `hw.hierpath` operations by adding path into the
+    module ports and replacing the sv.xmr operations with simple wire.
+  }];
+}
 #endif // CIRCT_DIALECT_HW_PASSES_TD
