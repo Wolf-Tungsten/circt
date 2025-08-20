@@ -15,6 +15,9 @@
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "hw-eliminate-hierpath"
 
 namespace circt {
 namespace hw {
@@ -47,8 +50,9 @@ LogicalResult HWEliminateHierPathPass::updateInstanceGlobally(
       instanceOps.push_back(instanceOp);
     }
   });
-  llvm::outs() << "Found " << instanceOps.size() << " instances of module "
-               << updatedModuleOp.getSymName() << "\n";
+  LLVM_DEBUG(llvm::dbgs() << "Found " << instanceOps.size()
+                          << " instances of module "
+                          << updatedModuleOp.getSymName() << "\n");
   // 更新每个 instance 的输出端口
   for (auto oldInstanceOp : instanceOps) {
     OpBuilder b(oldInstanceOp);
@@ -63,9 +67,10 @@ LogicalResult HWEliminateHierPathPass::updateInstanceGlobally(
         oldInstanceOp.getInstanceNameAttr(), oldInputs,
         oldInstanceOp.getParameters(), oldInstanceOp.getInnerSymAttr());
 
-    llvm::outs() << "New Instance Type: "
-                 << newInstanceOp.getType(newInstanceOp.getNumOutputPorts() - 1)
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "New Instance Type: "
+               << newInstanceOp.getType(newInstanceOp.getNumOutputPorts() - 1)
+               << "\n");
     // 将输出替换
     for (size_t i = 0; i < oldInstanceOp.getNumResults(); ++i) {
       oldInstanceOp.getResult(i).replaceAllUsesWith(newInstanceOp.getResult(i));
@@ -83,8 +88,8 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
   hw::HWModuleOp headModule = cast<hw::HWModuleOp>(
       SymbolTable::lookupSymbolIn(globalSymTable, pathHead.getModuleRef()));
   hw::HWModuleOp refModule = svXMRRefOp->getParentOfType<hw::HWModuleOp>();
-  llvm::outs() << "eliminateHierPath in module: " << headModule.getSymName()
-               << "\n";
+  LLVM_DEBUG(llvm::dbgs() << "eliminateHierPath in module: "
+                          << headModule.getSymName() << "\n");
   auto xmrName = svXMRRefOp.getRef();
   if (startIdx == namepath.size() - 1) {
     // 递归到底
@@ -93,7 +98,6 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
       // 报错，因为不允许在本地模块中使用 tap
       refModule->emitError(
           "Cannot use tap in the same module as the reference");
-      signalPassFailure();
       return failure();
     }
     // headModule 添加一个输出口
@@ -105,24 +109,24 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
       // 添加一个输出口
       headModule.appendOutput(xmrName, targetWireOp.getResult());
       // 更新 headModule 的所有 instance
-      updateInstanceGlobally(headModule);
-      return success();
+      return updateInstanceGlobally(headModule);
     } else {
       // 不是 wire，报错
       headModule->emitError("Expected a wire at the end of the path");
-      signalPassFailure();
       return failure();
     }
   } else {
     // 递归处理内部层次
-    eliminateHierPath(namepath, startIdx + 1, svXMRRefOp, globalSymTable);
+    if (failed(eliminateHierPath(namepath, startIdx + 1, svXMRRefOp,
+                                 globalSymTable))) {
+      return failure();
+    }
     // 找到对应的 instance
     auto headModuleInnerSymTable = InnerSymbolTable::get(headModule);
     auto updatedInstanceOp = dyn_cast<hw::InstanceOp>(
         headModuleInnerSymTable->lookupOp(pathHead.getName()));
     if (!updatedInstanceOp) {
       headModule->emitError("Expected an instance in the middle of the path");
-      signalPassFailure();
       return failure();
     }
     // instance 最后的一个 result 添加到 headModule 的输出上
@@ -153,8 +157,7 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
       // 中间层次
       headModule.appendOutput(xmrName, newResultValue);
       // 修改 headModule 的所有 instance，添加一个输出值
-      updateInstanceGlobally(headModule);
-      return success();
+      return updateInstanceGlobally(headModule);
     }
   }
 }
@@ -173,29 +176,12 @@ void HWEliminateHierPathPass::runOnOperation() {
       return;
     }
     // 打印模块名称、svXMRRefName以及path
-    eliminateHierPath(hierOp.getNamepath(), 0, svXMRRefOp, globalSymTable);
+    if (failed(eliminateHierPath(hierOp.getNamepath(), 0, svXMRRefOp,
+                                 globalSymTable))) {
+      signalPassFailure();
+      return;
+    }
     svXMRRefOp.erase();
     hierOp.erase();
   }
-
-  // getOperation().walk([&](hw::HWModuleOp hwModuleOp) {
-  //   hwModuleOp.walk([&](sv::XMRRefOp svXMRRefOp) {
-  //     auto *tableOp = SymbolTable::getNearestSymbolTable(svXMRRefOp);
-  //     auto *op = SymbolTable::lookupSymbolIn(tableOp, svXMRRefOp.getRef());
-  //     auto hierOp = dyn_cast<hw::HierPathOp>(op);
-  //     // 打印模块名称、svXMRRefName以及path
-  //     llvm::outs() << "Processing ModuleName:"
-  //                  <<
-  //                  svXMRRefOp->getParentOfType<hw::HWModuleOp>().getSymName()
-  //                  << " ref:" << svXMRRefOp.getRef() << " path: ";
-  //     for (Attribute path : hierOp.getNamepath()) {
-  //       auto innerRefPath = dyn_cast<hw::InnerRefAttr>(path);
-  //       llvm::outs() << innerRefPath.getModuleRef()
-  //                    << "::" << innerRefPath.getName() << "->";
-  //     }
-  //     llvm::outs() << "\n";
-  //     eliminateHierPath(hierOp.getNamepath(), 0, svXMRRefOp, globalSymTable);
-  //   });
-  // });
-  // exit(0);
 }
