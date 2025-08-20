@@ -72,8 +72,6 @@ LogicalResult HWEliminateHierPathPass::updateInstanceGlobally(
     }
     // 删除旧的 instance
     oldInstanceOp.erase();
-    llvm::outs() << "Updated instance: " << newInstanceOp.getInstanceName()
-                 << "\n";
   }
   return success();
 }
@@ -98,7 +96,7 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
       signalPassFailure();
       return failure();
     }
-    // TODO:headModule 添加一个输出口
+    // headModule 添加一个输出口
     // 找到 pathHead 指向的 op
     auto headModuleInnerSymTable = InnerSymbolTable::get(headModule);
     Operation *targetOp = headModuleInnerSymTable->lookupOp(pathHead.getName());
@@ -116,38 +114,46 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
       return failure();
     }
   } else {
+    // 递归处理内部层次
+    eliminateHierPath(namepath, startIdx + 1, svXMRRefOp, globalSymTable);
+    // 找到对应的 instance
+    auto headModuleInnerSymTable = InnerSymbolTable::get(headModule);
+    auto updatedInstanceOp = dyn_cast<hw::InstanceOp>(
+        headModuleInnerSymTable->lookupOp(pathHead.getName()));
+    if (!updatedInstanceOp) {
+      headModule->emitError("Expected an instance in the middle of the path");
+      signalPassFailure();
+      return failure();
+    }
+    // instance 最后的一个 result 添加到 headModule 的输出上
+    int resultIdx = updatedInstanceOp.getNumResults() - 1;
+    auto newResultValue = updatedInstanceOp.getResult(resultIdx);
+    SmallVector<sv::ReadInOutOp> readInOutOpsToRemove;
     if (refModule == headModule) {
-      eliminateHierPath(namepath, startIdx + 1, svXMRRefOp, globalSymTable);
-      // TODO：发生引用的位置，instance 已经添加好输出口，修改引用即可
-      llvm::outs() << "here is ref Module: " << headModule.getSymName() << "\n";
+      for (auto user : svXMRRefOp.getResult().getUsers()) {
+        if (!isa<sv::ReadInOutOp>(user)) {
+          svXMRRefOp->emitError(
+              "The result of sv.xmrref must be used by sv.readinout");
+          return failure();
+        }
+        if (user->getResult(0).getType() != newResultValue.getType()) {
+          user->emitError("The type of sv.readinout must match the type of the "
+                          "target signal");
+          return failure();
+        }
+        // Op 和 类型都匹配了
+        readInOutOpsToRemove.push_back(cast<sv::ReadInOutOp>(user));
+      }
+      for (auto readInOutOp : readInOutOpsToRemove) {
+        readInOutOp.getResult().replaceAllUsesWith(newResultValue);
+        readInOutOp.erase();
+      }
       return success();
     } else {
       // 中间层次
-      // 递归处理内部层次
-      eliminateHierPath(namepath, startIdx + 1, svXMRRefOp, globalSymTable);
-      // 找到对应的 instance
-      auto headModuleInnerSymTable = InnerSymbolTable::get(headModule);
-      auto updatedInstanceOp = dyn_cast<hw::InstanceOp>(
-          headModuleInnerSymTable->lookupOp(pathHead.getName()));
-      if (!updatedInstanceOp) {
-        headModule->emitError("Expected an instance in the middle of the path");
-        signalPassFailure();
-        return failure();
-      }
-      // instance 最后的一个 result 添加到 headModule 的输出上
-      int resultIdx = updatedInstanceOp.getNumResults() - 1;
-      auto newResultValue = updatedInstanceOp.getResult(resultIdx);
-      llvm::outs() << "Adding output of instance: "
-                   << updatedInstanceOp.getInstanceName()
-                   << " result index: " << resultIdx
-                   << "to Module:" << headModule.getSymName()
-                   << " with Type:" << newResultValue.getType() << "\n";
-
       headModule.appendOutput(xmrName, newResultValue);
-      //   修改 headModule 的所有 instance，添加一个输出值
+      // 修改 headModule 的所有 instance，添加一个输出值
       updateInstanceGlobally(headModule);
-      llvm::outs() << "here is intermediate Module: " << headModule.getSymName()
-                   << "\n";
       return success();
     }
   }
@@ -155,23 +161,41 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
 
 void HWEliminateHierPathPass::runOnOperation() {
   auto *globalSymTable = SymbolTable::getNearestSymbolTable(getOperation());
-  getOperation().walk([&](hw::HWModuleOp hwModuleOp) {
-    hwModuleOp.walk([&](sv::XMRRefOp svXMRRefOp) {
-      auto *tableOp = SymbolTable::getNearestSymbolTable(svXMRRefOp);
-      auto *op = SymbolTable::lookupSymbolIn(tableOp, svXMRRefOp.getRef());
-      auto hierOp = dyn_cast<hw::HierPathOp>(op);
-      // 打印模块名称、svXMRRefName以及path
-      llvm::outs() << "Processing ModuleName:"
-                   << svXMRRefOp->getParentOfType<hw::HWModuleOp>().getSymName()
-                   << " ref:" << svXMRRefOp.getRef() << " path: ";
-      for (Attribute path : hierOp.getNamepath()) {
-        auto innerRefPath = dyn_cast<hw::InnerRefAttr>(path);
-        llvm::outs() << innerRefPath.getModuleRef()
-                     << "::" << innerRefPath.getName() << "->";
-      }
-      llvm::outs() << "\n";
-      eliminateHierPath(hierOp.getNamepath(), 0, svXMRRefOp, globalSymTable);
-    });
-  });
+  SmallVector<sv::XMRRefOp> svXMRRefOps;
+  getOperation().walk(
+      [&](sv::XMRRefOp svXMRRefOp) { svXMRRefOps.push_back(svXMRRefOp); });
+  for (auto svXMRRefOp : svXMRRefOps) {
+    auto hierOp = dyn_cast<hw::HierPathOp>(
+        SymbolTable::lookupSymbolIn(globalSymTable, svXMRRefOp.getRef()));
+    if (!hierOp) {
+      svXMRRefOp->emitError("Expected a hw.hierpath operation for sv.xmrref");
+      signalPassFailure();
+      return;
+    }
+    // 打印模块名称、svXMRRefName以及path
+    eliminateHierPath(hierOp.getNamepath(), 0, svXMRRefOp, globalSymTable);
+    svXMRRefOp.erase();
+    hierOp.erase();
+  }
+
+  // getOperation().walk([&](hw::HWModuleOp hwModuleOp) {
+  //   hwModuleOp.walk([&](sv::XMRRefOp svXMRRefOp) {
+  //     auto *tableOp = SymbolTable::getNearestSymbolTable(svXMRRefOp);
+  //     auto *op = SymbolTable::lookupSymbolIn(tableOp, svXMRRefOp.getRef());
+  //     auto hierOp = dyn_cast<hw::HierPathOp>(op);
+  //     // 打印模块名称、svXMRRefName以及path
+  //     llvm::outs() << "Processing ModuleName:"
+  //                  <<
+  //                  svXMRRefOp->getParentOfType<hw::HWModuleOp>().getSymName()
+  //                  << " ref:" << svXMRRefOp.getRef() << " path: ";
+  //     for (Attribute path : hierOp.getNamepath()) {
+  //       auto innerRefPath = dyn_cast<hw::InnerRefAttr>(path);
+  //       llvm::outs() << innerRefPath.getModuleRef()
+  //                    << "::" << innerRefPath.getName() << "->";
+  //     }
+  //     llvm::outs() << "\n";
+  //     eliminateHierPath(hierOp.getNamepath(), 0, svXMRRefOp, globalSymTable);
+  //   });
+  // });
   // exit(0);
 }
