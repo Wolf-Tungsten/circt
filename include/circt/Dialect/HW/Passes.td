@@ -99,4 +99,11 @@ def HWEliminateHierPath : Pass<"hw-eliminate-hierpath", "mlir::ModuleOp"> {
     module ports and replacing the sv.xmr operations with simple wire.
   }];
 }
+
+def HWPrintStateElemDist: Pass<"hw-print-state-elem-dist", "mlir::ModuleOp"> {
+  let summary = "Print the distribution of state elements in CSV style";
+  let description = [{
+    This pass prints the distribution of state elements in a CSV format.
+  }];
+}
 #endif // CIRCT_DIALECT_HW_PASSES_TD
