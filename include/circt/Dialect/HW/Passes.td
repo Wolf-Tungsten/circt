@@ -106,4 +106,12 @@ def HWPrintStateElemDist: Pass<"hw-print-state-elem-dist", "mlir::ModuleOp"> {
     This pass prints the distribution of state elements in a CSV format.
   }];
 }
+
+def HWStripExternalModule: Pass<"hw-strip-external-module", "mlir::ModuleOp"> {
+  let summary = "Strip external module references";
+  let description = [{
+    This pass strips external module references and replaces them with
+    their internal counterparts.
+  }];
+}
 #endif // CIRCT_DIALECT_HW_PASSES_TD

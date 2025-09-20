@@ -9,6 +9,7 @@ add_circt_dialect_library(CIRCTHWTransforms
   FooWires.cpp
   HWEliminateHierPath.cpp
   HWPrintStateElemDist.cpp
+  HWStripExternalModule.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen
