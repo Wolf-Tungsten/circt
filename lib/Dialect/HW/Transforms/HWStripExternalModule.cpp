@@ -146,6 +146,10 @@ LogicalResult HWStripExternalModule::processSrcHWModule() {
     // 遍历 instanceOp 的所有输入，将其添加到src模块的输出接口
     for (unsigned int i = 0; i < instanceOp.getNumOperands(); i++) {
       auto operand = instanceOp.getOperand(i);
+      if (operand.getDefiningOp() == nullptr) {
+        // 这个 operand 是 block argument，不需要处理
+        continue;
+      }
       std::string outputName = "extp_";
       outputName += instanceName;
       outputName += "_in_";
@@ -196,6 +200,10 @@ void HWStripExternalModule::processSrcSVOpRecursivly(Operation *op) {
   for (unsigned int i = 0; i < op->getNumOperands(); i++) {
     auto operand = op->getOperand(i);
     auto defOp = operand.getDefiningOp();
+    if (defOp == nullptr) {
+      // 这个 operand 是 block argument，不需要处理
+      continue;
+    }
     if (defOp->getParentOp() ==
         srcHWModuleOp) { // 这个 operand 是定义在 srcHWModuleOp 层次上的
       std::string outputName = "extp_sv";
