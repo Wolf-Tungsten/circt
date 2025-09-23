@@ -15,6 +15,7 @@ using namespace ImportVerilog;
 using moore::IntAlign;
 using moore::IntFormat;
 using moore::IntPadding;
+using moore::RealFormat;
 using slang::ast::SFormat::FormatOptions;
 
 namespace {
@@ -129,17 +130,16 @@ struct FormatStringParser {
                          std::isupper(specifier) ? IntFormat::HexUpper
                                                  : IntFormat::HexLower);
 
+    case 'e':
+    case 'g':
+    case 'f':
+      return emitReal(arg, options, RealFormat::Float);
+
+    case 't':
+      return emitTime(arg, options);
+
     case 's':
-      // Simplified handling for literals.
-      if (auto *lit = arg.as_if<slang::ast::StringLiteral>()) {
-        if (options.width)
-          return mlir::emitError(loc)
-                 << "string format specifier with width not supported";
-        emitLiteral(lit->getValue());
-        return success();
-      }
-      return mlir::emitError(argLoc)
-             << "expression cannot be formatted as string";
+      return emitString(arg, options);
 
     default:
       return mlir::emitError(loc)
@@ -180,6 +180,78 @@ struct FormatStringParser {
     fragments.push_back(moore::FormatIntOp::create(builder, loc, value, format,
                                                    width, alignment, padding));
     return success();
+  }
+
+  LogicalResult emitReal(const slang::ast::Expression &arg,
+                         const FormatOptions &options, RealFormat format) {
+
+    // Ensures that the given value is moore.real
+    // i.e. $display("%f", 4) -> 4.000000, but 4 is not necessarily of real type
+    auto value = context.convertRvalueExpression(
+        arg, moore::RealType::get(context.getContext(), moore::RealWidth::f64));
+
+    if (!value)
+      return failure();
+
+    // TODO add support for specifics such as width etc
+
+    fragments.push_back(
+        moore::FormatRealOp::create(builder, loc, value, format));
+
+    return success();
+  }
+
+  // Format an integer with the %t specifier according to IEEE 1800-2023
+  // § 20.4.3 "$timeformat"
+  LogicalResult emitTime(const slang::ast::Expression &arg,
+                         const FormatOptions &options) {
+
+    // Only handle `TimeType` values.
+    auto value = context.convertRvalueExpression(
+        arg, moore::TimeType::get(context.getContext()));
+    if (!value)
+      return failure();
+
+    mlir::IntegerAttr width = nullptr;
+    if (options.width) {
+      mlir::Type i32Ty =
+          mlir::IntegerType::get(context.getContext(), /*width=*/32);
+      width = mlir::IntegerAttr::get(i32Ty, options.width.value());
+    }
+
+    // Delegate actual formatting to `moore.fmt.time`, annotate width if
+    // provided
+    if (width) {
+      fragments.push_back(
+          moore::FormatTimeOp::create(builder, loc, value, width));
+    } else {
+      fragments.push_back(moore::FormatTimeOp::create(builder, loc, value));
+    }
+
+    return success();
+  }
+
+  LogicalResult emitString(const slang::ast::Expression &arg,
+                           const FormatOptions &options) {
+    if (options.width)
+      return mlir::emitError(loc)
+             << "string format specifier with width not supported";
+
+    // Simplified handling for literals.
+    if (auto *lit = arg.as_if<slang::ast::StringLiteral>()) {
+      emitLiteral(lit->getValue());
+      return success();
+    }
+
+    // Handle expressions
+    if (auto value = context.convertRvalueExpression(
+            arg, builder.getType<moore::FormatStringType>())) {
+      fragments.push_back(value);
+      return success();
+    }
+
+    return mlir::emitError(context.convertLocation(arg.sourceRange))
+           << "expression cannot be formatted as string";
   }
 
   /// Emit an expression argument with the appropriate default formatting.

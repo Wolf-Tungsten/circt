@@ -227,3 +227,54 @@ func.func @WriteArray(%arg0: !arc.state<!hw.array<4xi1>>, %arg1: !hw.array<4xi1>
   arc.state_write %arg0 = %arg1 : <!hw.array<4xi1>>
   return
 }
+
+// The LLVM IR does not like `i0` types. The lowering replaces all `i0` values
+// with constants to allow canonicalizers to elide i0 values as needed.
+// See https://github.com/llvm/circt/pull/8871.
+// CHECK-LABEL: llvm.func @DontCrashOnI0(
+func.func @DontCrashOnI0(%arg0: i1, %arg1: !hw.array<1xi42>) -> i42 {
+  // CHECK: [[ZERO:%.+]] = llvm.mlir.constant(0 : i0) : i0
+  // CHECK: [[STACK:%.+]] = llvm.alloca {{%.+}} x !llvm.array<1 x i42>
+  // CHECK: [[ZEXT:%.+]] = llvm.zext [[ZERO]] : i0 to i1
+  // CHECK: [[GEP:%.+]] = llvm.getelementptr [[STACK]][0, [[ZEXT]]] :
+  // CHECK: [[RESULT:%.+]] = llvm.load [[GEP]] : !llvm.ptr -> i42
+  // CHECK: llvm.return [[RESULT]]
+  %0 = comb.extract %arg0 from 0 : (i1) -> i0
+  %1 = hw.array_get %arg1[%0] : !hw.array<1xi42>, i0
+  return %1 : i42
+}
+
+// CHECK-LABEL: llvm.func @ExecuteEmpty
+func.func @ExecuteEmpty() {
+  // CHECK-NEXT: llvm.br [[BB:\^.+]]
+  // CHECK-NEXT: [[BB]]:
+  arc.execute {
+    // CHECK-NEXT: llvm.br [[BB:\^.+]]
+    arc.output
+  }
+  // CHECK-NEXT: [[BB]]:
+  // CHECK-NEXT: llvm.return
+  return
+}
+
+// CHECK-LABEL: llvm.func @ExecuteWithOperandsAndResults
+func.func @ExecuteWithOperandsAndResults(%arg0: i42, %arg1: !hw.array<4xi19>, %arg2: !arc.storage) {
+  // CHECK-NEXT: llvm.br [[BB:\^.+]](%arg0, %arg1, %arg2 : i42, !llvm.array<4 x i19>, !llvm.ptr)
+  // CHECK-NEXT: [[BB]]([[ARG0:%.+]]: i42, [[ARG1:%.+]]: !llvm.array<4 x i19>, [[ARG2:%.+]]: !llvm.ptr):
+  %4:3 = arc.execute (%arg0, %arg1, %arg2 : i42, !hw.array<4xi19>, !arc.storage) -> (i42, !hw.array<4xi19>, !arc.storage) {
+  ^bb0(%0: i42, %1: !hw.array<4xi19>, %2: !arc.storage):
+    // CHECK-NEXT: llvm.br [[BB:\^.+]]([[ARG2]] : !llvm.ptr)
+    cf.br ^bb1(%2 : !arc.storage)
+  ^bb1(%3: !arc.storage):
+    // CHECK-NEXT: [[BB]]([[ARG2:%.+]]: !llvm.ptr):
+    // CHECK-NEXT: llvm.br [[BB:\^.+]]([[ARG0]], [[ARG1]], [[ARG2]] : i42, !llvm.array<4 x i19>, !llvm.ptr)
+    arc.output %0, %1, %3 : i42, !hw.array<4xi19>, !arc.storage
+  }
+  // CHECK-NEXT: [[BB]]([[ARG0:%.+]]: i42, [[ARG1:%.+]]: !llvm.array<4 x i19>, [[ARG2:%.+]]: !llvm.ptr):
+  // CHECK-NEXT: llvm.call @Dummy([[ARG0:%.+]], [[ARG1:%.+]], [[ARG2:%.+]]) : (i42, !llvm.array<4 x i19>, !llvm.ptr) -> ()
+  call @Dummy(%4#0, %4#1, %4#2) : (i42, !hw.array<4xi19>, !arc.storage) -> ()
+  // CHECK-NEXT: llvm.return
+  return
+}
+
+func.func private @Dummy(%arg0: i42, %arg1: !hw.array<4xi19>, %arg2: !arc.storage)
