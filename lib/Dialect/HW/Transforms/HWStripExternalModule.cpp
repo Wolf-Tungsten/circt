@@ -282,10 +282,8 @@ LogicalResult HWStripExternalModule::processDstHWModule() {
     }
   }
 
-  // step 3. 将原有输出删除
-  auto outOp = cast<hw::OutputOp>(terminatorOp);
-  outOp->eraseOperands(0, originalOutputNum);
-  dstHWModuleOp.erasePorts({}, outputIndicesToRemove);
+  // step 3. 将原有端口都删除
+  dstHWModuleOp.erasePorts(inputIndicesToRemove, outputIndicesToRemove);
 
   // step 3. 添加输入
   // for (auto [name, value] : dstToInputValues) {
