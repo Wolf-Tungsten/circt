@@ -114,4 +114,50 @@ def HWStripExternalModule: Pass<"hw-strip-external-module", "mlir::ModuleOp"> {
     their internal counterparts.
   }];
 }
+def HWSeqmemToCombmem : Pass<"hw-seqmem-to-combmem", "mlir::ModuleOp"> {
+  let summary = "Convert all SeqMem to CombMem";
+  let description = [{
+    This pass convert `seq.firmem` with readLatency > 0 to 0 with extra `seq.firreg`.
+  }];
+}
+
+def HWAssignUniqueInnerSym : Pass<"hw-assign-unique-inner-sym", "mlir::ModuleOp"> {
+  let summary = "Assign unique InnerSym for firreg and firmem ports";
+  let description = [{
+    This pass add unique InnerSym for all `seq::FirRegOp`, `seq::FirMemReadOp`,
+    `seq::FirMemWriteOp` and `seq::FirMemReadWriteOp` in a module.
+  }];
+}
+
+def HWAssignUniqueID : Pass<"hw-assign-unique-id", "mlir::ModuleOp"> {
+  let summary = "Assign unique ID for firreg and firmem ports";
+  let description = [{
+    This pass add unique ID for all `seq::FirRegOp`, `seq::FirMemReadOp`,
+    `seq::FirMemWriteOp` and `seq::FirMemReadWriteOp` in a module.
+  }];
+}
+
+def HWInsertWires : Pass<"hw-insert-wires", "hw::HWModuleOp"> {
+  let summary = "Insert wires for direct connections between module ports and seq operations";
+  let description = [{
+    This pass inserts hw.wire operations between direct connections involving:
+    - hw.module IOs and seq register/memory operations
+    - Direct connections between seq register/memory operations
+    
+    The target operations are seq::FirRegOp, seq::FirMemReadOp, 
+    seq::FirMemWriteOp, and seq::FirMemReadWriteOp.
+  }];
+}
+
+def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
+  let summary = "Split flattened module into sequential S and combinational C modules";
+  let description = [{
+    Duplicate the flattened hw.module into S and C. Keep hw.constant in both.
+    In S: keep only seq ops (FirRegOp/FirMem*), replace their non-constant operands
+    with new inputs, and export their results as outputs. Remove non-seq/non-const ops.
+    In C: add outputs for values that feed seq op operands (non-const), add inputs for
+    seq op results and replace uses, then erase seq ops. The original module is erased.
+  }];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD

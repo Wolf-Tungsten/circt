@@ -10,6 +10,11 @@ add_circt_dialect_library(CIRCTHWTransforms
   HWEliminateHierPath.cpp
   HWPrintStateElemDist.cpp
   HWStripExternalModule.cpp
+  HWSeqmemToCombmem.cpp
+  HWAssignUniqueInnerSym.cpp
+  HWAssignUniqueID.cpp
+  HWInsertWires.cpp
+  HWSplitSeqComb.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen
