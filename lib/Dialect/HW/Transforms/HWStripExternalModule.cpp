@@ -106,6 +106,10 @@ void HWStripExternalModule::runOnOperation() {
     srcToErase.clear();
     srcToInputValues.clear();
     srcToOutputValues.clear();
+    dstToErase.clear();
+    dstToInputValues.clear();
+    dstToOutputValues.clear();
+    svOpLabelCount = 0;
   });
 }
 
@@ -151,10 +155,6 @@ LogicalResult HWStripExternalModule::processSrcHWModule() {
     // 遍历 instanceOp 的所有输入，将其添加到src模块的输出接口
     for (unsigned int i = 0; i < instanceOp.getNumOperands(); i++) {
       auto operand = instanceOp.getOperand(i);
-      if (operand.getDefiningOp() == nullptr) {
-        // 这个 operand 是 block argument，不需要处理
-        continue;
-      }
       std::string outputName = "extp_";
       outputName += instanceName;
       outputName += "_in_";
@@ -205,12 +205,10 @@ void HWStripExternalModule::processSrcSVOpRecursivly(Operation *op) {
   for (unsigned int i = 0; i < op->getNumOperands(); i++) {
     auto operand = op->getOperand(i);
     auto defOp = operand.getDefiningOp();
-    if (defOp == nullptr) {
-      // 这个 operand 是 block argument，不需要处理
-      continue;
-    }
-    if (defOp->getParentOp() ==
-        srcHWModuleOp) { // 这个 operand 是定义在 srcHWModuleOp 层次上的
+    if ((defOp == nullptr &&
+         operand.getParentRegion()->getParentOp() == srcHWModuleOp) ||
+        defOp->getParentOp() == srcHWModuleOp) {
+      // 这个 operand 是定义在 srcHWModuleOp 层次上的
       std::string outputName = "extp_sv";
       outputName += getSVOpLabel(op);
       outputName += "_in_";
@@ -271,50 +269,38 @@ LogicalResult HWStripExternalModule::processDstHWModule() {
   unsigned int originalOutputNum = dstHWModuleOp.getNumOutputPorts();
   llvm::SmallVector<unsigned, 4> inputIndicesToRemove;
   llvm::SmallVector<unsigned, 4> outputIndicesToRemove;
-  for (unsigned i = 0; i < originalInputNum + originalOutputNum; i++) {
-    llvm::outs() << "Port " << i << ": ";
-    if (dstHWModuleOp.getPort(i).isInput()) {
-      llvm::outs() << "Input\n";
-      inputIndicesToRemove.push_back(i);
-    } else if (dstHWModuleOp.getPort(i).isOutput()) {
-      llvm::outs() << "Output\n";
-      outputIndicesToRemove.push_back(i);
-    }
+  for (unsigned i = 0; i < originalOutputNum; i++) {
+    outputIndicesToRemove.push_back(i);
+  }
+  for (unsigned i = 0; i < originalInputNum; i++) {
+    inputIndicesToRemove.push_back(i);
   }
 
-  // step 3. 将原有端口都删除
-  dstHWModuleOp.erasePorts(inputIndicesToRemove, outputIndicesToRemove);
+  // step 3. 将原有输出端口都删除
+  terminatorOp->eraseOperands(0, originalOutputNum);
+  dstHWModuleOp.erasePorts({}, outputIndicesToRemove);
 
-  // step 3. 添加输入
-  // for (auto [name, value] : dstToInputValues) {
-  //   auto [portName, blockArgument] =
-  //       dstHWModuleOp.appendInput(name, value.getType());
-  //   value.replaceAllUsesWith(blockArgument);
-  // }
+  // step 4. 添加输出端口
+  for (auto [name, value] : dstToOutputValues) {
+    dstHWModuleOp.appendOutput(name, value);
+  }
 
-  // step x. 删除所有标记的操作
-  // for (auto op : dstToErase) {
-  //   op->dropAllUses();
-  //   op->erase(); // 现在才能安全释放
-  // }
+  // step 5. 添加输入端口
+  for (auto [name, value] : dstToInputValues) {
+    auto [portName, blockArgument] =
+        dstHWModuleOp.appendInput(name, value.getType());
+    value.replaceAllUsesWith(blockArgument);
+  }
 
-  // for (auto [name, value] : dstToInputValues) {
-  //   auto [portName, blockArgument] =
-  //       dstHWModuleOp.appendInput(name, value.getType());
-  //   value.replaceAllUsesWith(blockArgument);
-  // }
-  // // 添加新的输出端口
-  // for (auto [name, value] : dstToOutputValues) {
-  //   dstHWModuleOp.appendOutput(name, value);
-  // }
+  // step 6. 删除所有标记的操作
+  for (auto op : dstToErase) {
+    op->dropAllUses();
+    op->erase(); // 现在才能安全释放
+  }
 
-  // dstHWModuleOp.modifyPorts({}, {}, inputIndicesToRemove,
-  //                           outputIndicesToRemove);
-
-  // 修改 block arguments
-  // dstHWModuleOp.getBody().front().eraseArguments(0, originalInputNum);
-  // 修改 terminator operands
-  // terminatorOp->eraseOperands(0, originalOutputNum);
+  // step 7. 删除所有原有输入端口
+  dstHWModuleOp.erasePorts(inputIndicesToRemove, {});
+  dstHWModuleOp.getBody().front().eraseArguments(0, originalInputNum);
   return success();
 }
 
