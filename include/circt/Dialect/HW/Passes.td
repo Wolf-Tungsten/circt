@@ -160,4 +160,15 @@ def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
   }];
 }
 
+def HWGlobalUniqueInnerSym : Pass<"hw-global-unique-inner-sym", "mlir::ModuleOp"> {
+  let summary = "Ensure all op inner_syms are globally unique across the ModuleOp";
+  let description = [{
+    This pass scans every Op with InnerSymbolOpInterface that has an `inner_sym` attribute and rewrites
+    duplicate inner symbol names to a unique variant.  Uniqueness is enforced across
+    the whole top-level `mlir::ModuleOp`, not just per `hw.module`.  Any attribute
+    (e.g. `hw.hierpath`) that references an affected inner symbol through an
+    `InnerRefAttr` is updated to point at the new name.
+  }];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD

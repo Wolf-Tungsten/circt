@@ -46,22 +46,12 @@ struct HWStripExternalModule
   llvm::SmallVector<std::pair<std::string, Value>, 4> dstToOutputValues;
   llvm::SmallVector<std::pair<std::string, Value>, 4> dstToInputValues;
 
-  uint64_t svOpLabelCount = 0;
-  LogicalResult addLabelToSVOp();
-  LogicalResult addLabelToSVOp(Operation *op, bool top);
-  void processSrcSVOpRecursivly(Operation *op);
   LogicalResult processSrcHWModule();
-  void processDstSVOpRecursivly(Operation *op);
   LogicalResult processDstHWModule();
+  std::string
+  portNameGuard(std::string expectedPortName, hw::HWModuleOp moduleOp,
+                llvm::ArrayRef<std::pair<std::string, Value>> existingPorts);
 
-  bool isSVOp(Operation *op) {
-    return op->getDialect() ==
-           op->getContext()->getLoadedDialect<circt::sv::SVDialect>();
-  }
-  std::string getSVOpLabel(Operation *op) {
-    auto attr = op->getAttrOfType<StringAttr>("corvus_svop_label");
-    return attr.getValue().str();
-  }
   bool isExternalInstanceOp(Operation *op) {
     if (auto instanceOp = dyn_cast<hw::InstanceOp>(op)) {
       auto moduleName = instanceOp.getModuleName();
@@ -82,15 +72,10 @@ void HWStripExternalModule::runOnOperation() {
   module.walk([&](hw::HWModuleOp hwModule) {
     // 对于每个 hwModule 单独处理
     srcHWModuleOp = hwModule;
-    // 给所有 sv 方言操作加一个 tmp_label
-    if (failed(addLabelToSVOp())) {
-      signalPassFailure();
-      return;
-    }
     // 在 module 中，克隆一个 srcHWModuleOp，作为 dstHWModuleOp
     OpBuilder builder(module.getBodyRegion());
     dstHWModuleOp = srcHWModuleOp.clone();
-    std::string newName = (dstHWModuleOp.getName() + "StrippedExternal").str();
+    std::string newName = (dstHWModuleOp.getName() + "_StrippedExternal").str();
     dstHWModuleOp.setSymNameAttr(builder.getStringAttr(newName));
     builder.insert(dstHWModuleOp);
     // 处理 srcHWModuleOp
@@ -109,40 +94,7 @@ void HWStripExternalModule::runOnOperation() {
     dstToErase.clear();
     dstToInputValues.clear();
     dstToOutputValues.clear();
-    svOpLabelCount = 0;
   });
-}
-
-LogicalResult HWStripExternalModule::addLabelToSVOp(Operation *op, bool top) {
-  // 判断是否为 sv 方言的操作
-  // 如果没有 label 属性，就添加一个
-  if (!top || isSVOp(op)) {
-    if (!op->hasAttr("corvus_svop_label")) {
-      OpBuilder b(op);
-      op->setAttr("corvus_svop_label",
-                  b.getStringAttr(std::to_string(svOpLabelCount++)));
-    }
-  }
-  // 递归处理子操作
-  for (auto &region : op->getRegions()) {
-    for (auto &block : region) {
-      for (auto &nestedOp : block) {
-        if (failed(addLabelToSVOp(&nestedOp, false)))
-          return failure();
-      }
-    }
-  }
-  return success();
-}
-
-LogicalResult HWStripExternalModule::addLabelToSVOp() {
-  for (auto &block : srcHWModuleOp.getBodyRegion()) {
-    for (auto &op : block.getOperations()) {
-      if (failed(addLabelToSVOp(&op, true)))
-        return failure();
-    }
-  }
-  return success();
 }
 
 LogicalResult HWStripExternalModule::processSrcHWModule() {
@@ -159,6 +111,8 @@ LogicalResult HWStripExternalModule::processSrcHWModule() {
       outputName += instanceName;
       outputName += "_in_";
       outputName += std::to_string(i);
+      outputName = portNameGuard(outputName, srcHWModuleOp,
+                                 srcToOutputValues); // 避免重名
       srcToOutputValues.push_back({outputName, operand});
     }
     // 遍历 instanceOp 的所有输出，将其添加到src模块的输入接口
@@ -168,22 +122,14 @@ LogicalResult HWStripExternalModule::processSrcHWModule() {
       inputName += instanceName;
       inputName += "_out_";
       inputName += std::to_string(i);
+      inputName = portNameGuard(inputName, srcHWModuleOp,
+                                srcToInputValues); // 避免重名
       srcToInputValues.push_back({inputName, result});
     }
     // 将 instanceOp 标记为待删除
     srcToErase.push_back(instanceOp);
   });
 
-  // 遍历 src 所有直接的操作，不能用 walk，因为 walk 会递归进入 region
-  for (auto &block : srcHWModuleOp.getBodyRegion()) {
-    for (auto &op : block.getOperations()) {
-      if (isSVOp(&op)) {
-        processSrcSVOpRecursivly(&op);
-        // 标记该 sv 操作为待删除
-        srcToErase.push_back(&op);
-      }
-    }
-  }
   // 添加新的输入输出端口
   for (auto [name, value] : srcToOutputValues) {
     srcHWModuleOp.appendOutput(name, value);
@@ -200,42 +146,12 @@ LogicalResult HWStripExternalModule::processSrcHWModule() {
   return success();
 }
 
-void HWStripExternalModule::processSrcSVOpRecursivly(Operation *op) {
-  // 分析 sv 操作的输入操作数
-  for (unsigned int i = 0; i < op->getNumOperands(); i++) {
-    auto operand = op->getOperand(i);
-    auto defOp = operand.getDefiningOp();
-    if ((defOp == nullptr &&
-         operand.getParentRegion()->getParentOp() == srcHWModuleOp) ||
-        defOp->getParentOp() == srcHWModuleOp) {
-      // 这个 operand 是定义在 srcHWModuleOp 层次上的
-      std::string outputName = "extp_sv";
-      outputName += getSVOpLabel(op);
-      outputName += "_in_";
-      outputName += std::to_string(i);
-      srcToOutputValues.push_back({outputName, operand});
-    }
-  }
-  // srcToErase.push_back(op);
-  // llvm::outs() << "Marking SV Op for Erase: " << getSVOpLabel(op) << "\n";
-  //    递归进入 op 内部
-  for (auto &region : op->getRegions()) {
-    for (auto &block : region) {
-      for (auto &nestedOp : block) {
-        processSrcSVOpRecursivly(&nestedOp);
-      }
-    }
-  }
-};
-
 LogicalResult HWStripExternalModule::processDstHWModule() {
   auto terminatorOp = dstHWModuleOp.getBody().front().getTerminator();
   // step 1. 收集所有需要添加的接口、需要删除的 op
   for (auto &block : dstHWModuleOp.getBody().getBlocks()) {
     for (auto &op : block.getOperations()) {
-      if (isSVOp(&op)) {
-        processDstSVOpRecursivly(&op);
-      } else if (isExternalInstanceOp(&op)) {
+      if (isExternalInstanceOp(&op)) {
         // 处理输入，如果输入是来自 op 的，则添加成输入
         auto instanceOp = cast<hw::InstanceOp>(op);
         auto instanceName = instanceOp.getInstanceName().str();
@@ -245,6 +161,7 @@ LogicalResult HWStripExternalModule::processDstHWModule() {
           inputName += instanceName;
           inputName += "_in_";
           inputName += std::to_string(i);
+          inputName = portNameGuard(inputName, dstHWModuleOp, dstToInputValues);
           dstToInputValues.push_back({inputName, operand});
         }
         // 处理输出，如果输出是被 op 使用的，则添加成输出
@@ -254,6 +171,8 @@ LogicalResult HWStripExternalModule::processDstHWModule() {
           outputName += instanceName;
           outputName += "_out_";
           outputName += std::to_string(i);
+          outputName =
+              portNameGuard(outputName, dstHWModuleOp, dstToOutputValues);
           dstToOutputValues.push_back({outputName, result});
         }
       } else {
@@ -304,34 +223,30 @@ LogicalResult HWStripExternalModule::processDstHWModule() {
   return success();
 }
 
-void HWStripExternalModule::processDstSVOpRecursivly(Operation *op) {
-  // 分析 sv 操作的输入操作数
-  for (unsigned int i = 0; i < op->getNumOperands(); i++) {
-    auto operand = op->getOperand(i);
-
-    std::string inputName = "extp_sv";
-    inputName += getSVOpLabel(op);
-    inputName += "_in_";
-    inputName += std::to_string(i);
-    auto defOp = operand.getDefiningOp();
-    if (defOp == nullptr) {
-      // 这个 operand 是 block argument，需要判断是不是顶层模块的输入
-      if (operand.getParentBlock() == &dstHWModuleOp.getBody().front()) {
-        dstToInputValues.push_back({inputName, operand});
+std::string HWStripExternalModule::portNameGuard(
+    std::string expectedPortName, hw::HWModuleOp moduleOp,
+    llvm::ArrayRef<std::pair<std::string, Value>> existingPorts) {
+  std::string portName = expectedPortName;
+  int suffix = 0;
+  bool conflict = true;
+  while (conflict) {
+    conflict = false;
+    // 是否和马上添加的port重复？
+    for (auto [existingPortName, _] : existingPorts) {
+      if (existingPortName == portName) {
+        conflict = true;
+        portName = expectedPortName + "_" + std::to_string(suffix++);
+        break;
       }
-    } else {
-      if (defOp->getParentOp() ==
-          dstHWModuleOp) { // 这个 operand 是定义在 dstHWModuleOp 层次上的
-        dstToInputValues.push_back({inputName, operand});
+    }
+    // 是否和 moduleOp 里已有的 port 重复？
+    for (auto port : moduleOp.getPortList()) {
+      if (port.name == portName) {
+        conflict = true;
+        portName = expectedPortName + "_" + std::to_string(suffix++);
+        break;
       }
     }
   }
-
-  for (auto &region : op->getRegions()) {
-    for (auto &block : region) {
-      for (auto &nestedOp : block) {
-        processDstSVOpRecursivly(&nestedOp);
-      }
-    }
-  }
-};
+  return portName;
+}
