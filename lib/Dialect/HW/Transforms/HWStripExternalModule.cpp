@@ -51,18 +51,6 @@ struct HWStripExternalModule
   std::string
   portNameGuard(std::string expectedPortName, hw::HWModuleOp moduleOp,
                 llvm::ArrayRef<std::pair<std::string, Value>> existingPorts);
-
-  bool isExternalInstanceOp(Operation *op) {
-    if (auto instanceOp = dyn_cast<hw::InstanceOp>(op)) {
-      auto moduleName = instanceOp.getModuleName();
-      auto symbolTable = mlir::SymbolTable(mlirModuleOp);
-      auto referencedModule =
-          symbolTable.lookup<hw::HWModuleExternOp>(moduleName);
-      if (referencedModule)
-        return true;
-    }
-    return false;
-  }
 };
 } // namespace
 
@@ -70,13 +58,21 @@ void HWStripExternalModule::runOnOperation() {
   auto module = getOperation();
   mlirModuleOp = module;
   module.walk([&](hw::HWModuleOp hwModule) {
+    if (hwModule.isPrivate()) {
+      return; // 只处理顶层模块
+    }
     // 对于每个 hwModule 单独处理
     srcHWModuleOp = hwModule;
     // 在 module 中，克隆一个 srcHWModuleOp，作为 dstHWModuleOp
     OpBuilder builder(module.getBodyRegion());
     dstHWModuleOp = srcHWModuleOp.clone();
-    std::string newName = (dstHWModuleOp.getName() + "_StrippedExternal").str();
+    std::string newName = (dstHWModuleOp.getName() + "_corvus_external").str();
     dstHWModuleOp.setSymNameAttr(builder.getStringAttr(newName));
+    dstHWModuleOp.setPrivate();
+    // dstHWModuleOp 添加一个 corvus_external 属性
+    dstHWModuleOp->setAttr("corvus_external", builder.getUnitAttr());
+    // srcHWModuleOp 添加一个 corvus_top 属性
+    srcHWModuleOp->setAttr("corvus_top", builder.getUnitAttr());
     builder.insert(dstHWModuleOp);
     // 处理 srcHWModuleOp
     if (failed(processSrcHWModule())) {
@@ -95,14 +91,19 @@ void HWStripExternalModule::runOnOperation() {
     dstToInputValues.clear();
     dstToOutputValues.clear();
   });
+  // 删除多余的 sv.bind
+  llvm::SmallVector<sv::BindOp, 4> svBindOps;
+  for (auto svBindOp : module.getOps<sv::BindOp>()) {
+    svBindOps.push_back(svBindOp);
+  }
+  for (auto svBindOp : svBindOps) {
+    svBindOp.erase();
+  }
 }
 
 LogicalResult HWStripExternalModule::processSrcHWModule() {
   // 遍历所有的 hw.instance
-  srcHWModuleOp.walk([&](hw::InstanceOp instanceOp) {
-    if (!isExternalInstanceOp(instanceOp)) {
-      return;
-    }
+  for (hw::InstanceOp instanceOp : srcHWModuleOp.getOps<hw::InstanceOp>()) {
     auto instanceName = instanceOp.getInstanceName().str();
     // 遍历 instanceOp 的所有输入，将其添加到src模块的输出接口
     for (unsigned int i = 0; i < instanceOp.getNumOperands(); i++) {
@@ -128,7 +129,7 @@ LogicalResult HWStripExternalModule::processSrcHWModule() {
     }
     // 将 instanceOp 标记为待删除
     srcToErase.push_back(instanceOp);
-  });
+  }
 
   // 添加新的输入输出端口
   for (auto [name, value] : srcToOutputValues) {
@@ -151,7 +152,7 @@ LogicalResult HWStripExternalModule::processDstHWModule() {
   // step 1. 收集所有需要添加的接口、需要删除的 op
   for (auto &block : dstHWModuleOp.getBody().getBlocks()) {
     for (auto &op : block.getOperations()) {
-      if (isExternalInstanceOp(&op)) {
+      if (isa<hw::InstanceOp>(op)) {
         // 处理输入，如果输入是来自 op 的，则添加成输入
         auto instanceOp = cast<hw::InstanceOp>(op);
         auto instanceName = instanceOp.getInstanceName().str();

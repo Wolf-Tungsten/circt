@@ -160,6 +160,22 @@ def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
   }];
 }
 
+def HWFixXMRRef : Pass<"hw-fix-xmr-ref", "mlir::ModuleOp"> {
+  let summary = "Resolve sv.xmrref and eliminate unused hw.hierpath ops after flatten";
+  let description = [{
+    After module flattening and global inner symbol uniquification, each
+    `sv.xmrref` should reference a `hw.hierpath` whose last element resolves
+    directly to a unique target operation (e.g. `hw.wire`). This pass:
+      * Replaces `sv.xmrref` users (optionally wrapped in `sv.read_inout`) with
+        the referenced value.
+      * Deletes the `sv.xmrref` (and enclosing `sv.read_inout` if it becomes
+        dead).
+      * Removes any `hw.hierpath` ops left with zero references.
+    This reduces IR noise and prevents verify failures from dangling
+    hierpaths.
+  }];
+}
+
 def HWGlobalUniqueInnerSym : Pass<"hw-global-unique-inner-sym", "mlir::ModuleOp"> {
   let summary = "Ensure all op inner_syms are globally unique across the ModuleOp";
   let description = [{

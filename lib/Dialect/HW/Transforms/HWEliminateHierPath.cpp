@@ -90,7 +90,8 @@ LogicalResult HWEliminateHierPathPass::eliminateHierPath(
   hw::HWModuleOp refModule = svXMRRefOp->getParentOfType<hw::HWModuleOp>();
   LLVM_DEBUG(llvm::dbgs() << "eliminateHierPath in module: "
                           << headModule.getSymName() << "\n");
-  auto xmrName = svXMRRefOp.getRef();
+  std::string xmrName = svXMRRefOp.getRef().str();
+  xmrName = "xmr_" + xmrName;
   if (startIdx == namepath.size() - 1) {
     // 递归到底
     // 不会出现 tap 本地模块信号的情况
@@ -183,5 +184,12 @@ void HWEliminateHierPathPass::runOnOperation() {
     }
     svXMRRefOp.erase();
     hierOp.erase();
+  }
+  SmallVector<hw::HierPathOp> hierPaths;
+  getOperation().walk([&](hw::HierPathOp op) { hierPaths.push_back(op); });
+  for (auto hp : hierPaths) {
+    LLVM_DEBUG(llvm::dbgs() << "Erasing hierpath: " << hp.getSymName() << " : "
+                            << hp << "\n");
+    hp.erase();
   }
 }

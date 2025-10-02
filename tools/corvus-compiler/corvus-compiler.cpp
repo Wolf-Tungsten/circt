@@ -693,11 +693,12 @@ LogicalResult processBuffer(
   pm.addPass(verif::createLowerFormalToHWPass());
   pm.addPass(verif::createLowerSymbolicValuesPass(
       {corvusCompilerOptions.getSymbolicValueLowering()}));
-  pm.addPass(hw::createHWGlobalUniqueInnerSym());
+  pm.addPass(hw::createHWEliminateHierPath());
   pm.addPass(hw::createFlattenModules());
+  pm.addPass(hw::createHWGlobalUniqueInnerSym());
   pm.addPass(sv::createSVExtractTestCodePass(false, true, false));
   pm.addPass(hw::createHWStripExternalModule());
-  //    Corvus Compiler Pass End
+  //      Corvus Compiler Pass End
 
   // If requested, emit the HW IR to hwOutFile.
   if (!hwOutFile.empty())

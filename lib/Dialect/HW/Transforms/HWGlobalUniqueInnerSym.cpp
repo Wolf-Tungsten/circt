@@ -41,126 +41,86 @@ struct HWGlobalUniqueInnerSymPass
 };
 } // namespace
 
-static InnerSymAttr rewriteSingle(InnerSymAttr attr, StringAttr oldName,
-                                  StringAttr newName) {
-  SmallVector<InnerSymPropertiesAttr> newProps;
-  newProps.reserve(attr.getProps().size());
-  for (auto p : attr.getProps()) {
-    if (p.getName() == oldName) {
-      // Preserve fieldID and visibility; only change the symbol name.
-      newProps.push_back(InnerSymPropertiesAttr::get(
-          attr.getContext(), newName, p.getFieldID(), p.getSymVisibility()));
-    } else {
-      newProps.push_back(p);
-    }
-  }
-  return InnerSymAttr::get(attr.getContext(), newProps);
-}
-
 void HWGlobalUniqueInnerSymPass::runOnOperation() {
   ModuleOp top = getOperation();
   MLIRContext *ctx = &getContext();
 
-  // Collect all hierpath ops to allow updates later.
-  SmallVector<hw::HierPathOp> hierPaths;
-  for (auto hp : top.getOps<hw::HierPathOp>())
-    hierPaths.push_back(hp);
+  // Counter per base name for suffix generation.
+  DenseMap<StringAttr, unsigned> globalNameCounters;
 
-  // Map from fully qualified (moduleName, innerSymName) to chosen unique name.
-  // We only rename when the same innerSymName appears in different modules.
-  DenseMap<StringAttr, unsigned> globalNameCounts; // base -> next suffix
-  // For quick uniqueness test across modules we store wire ops per inner name.
-  DenseMap<StringAttr,
-           SmallVector<std::pair<hw::HWModuleOp, hw::InnerSymbolOpInterface>>>
-      opsPerName;
+  // For each property name: list of (moduleOp, ifaceOp, propertyIndex).
+  DenseMap<
+      StringAttr,
+      SmallVector<std::tuple<hw::HWModuleOp, InnerSymbolOpInterface, unsigned>>>
+      nameToProps;
+  // Keep a list of all (module, iface) pairs to allow bulk rewrite.
+  SmallVector<std::pair<hw::HWModuleOp, InnerSymbolOpInterface>> ifaceList;
 
-  // First pass: gather ops with inner_sym.
   top.walk([&](hw::HWModuleOp mod) {
-    mod.walk([&](hw::InnerSymbolOpInterface opWithInnerSym) {
-      auto inner = opWithInnerSym.getInnerSymAttr();
-      if (!inner)
-        return;
-      if (auto sym = inner.getSymIfExists(0)) { // only look at first prop
-        llvm::outs() << "Found op with inner_sym: " << sym << " in module "
-                     << mod.getName() << "\n";
-        opsPerName[sym].push_back({mod, opWithInnerSym});
+    mod.walk([&](Operation *op) {
+      if (auto iface = dyn_cast<InnerSymbolOpInterface>(op)) {
+        if (auto symAttr = iface.getInnerSymAttr()) {
+          ifaceList.emplace_back(mod, iface);
+          for (auto en : llvm::enumerate(symAttr.getProps())) {
+            nameToProps[en.value().getName()].push_back(
+                {mod, iface, en.index()});
+          }
+        }
       }
     });
   });
 
-  // Second pass: For any inner symbol name that appears in more than one
-  // module, rename ops after the first occurrence.
-  DenseMap<hw::InnerSymbolOpInterface, StringAttr>
-      renameMap; // op -> new simple name
-  // Track mapping: (module symbol, oldName) -> newName for reference updates.
-  DenseMap<std::pair<StringAttr, StringAttr>, StringAttr> oldToNew;
-  for (auto &it : opsPerName) {
-    auto &vec = it.getSecond();
+  // Determine renames: keep first occurrence of each name, rename all others.
+  DenseMap<std::tuple<hw::HWModuleOp, InnerSymbolOpInterface, unsigned>,
+           StringAttr>
+      renameMap;
+  for (auto &bucket : nameToProps) {
+    auto &vec = bucket.getSecond();
     if (vec.size() <= 1)
-      continue; // unique already
-    // Keep first as-is; others get suffixed.
-    unsigned idx = 0;
-    for (auto &pair : vec) {
-      auto op = pair.second;
-      if (idx++ == 0)
-        continue;
-      auto base = it.getFirst();
-      auto &next = globalNameCounts[base];
-      // ensure suffixing uniqueness even if pass re-run.
+      continue; // already unique
+    unsigned &counter = globalNameCounters[bucket.getFirst()];
+    for (size_t i = 0; i < vec.size(); ++i) {
+      if (i == 0)
+        continue; // retain first
+      StringAttr base = bucket.getFirst();
       StringAttr newName;
-      while (true) {
+      do {
         newName = StringAttr::get(
-            ctx, (base.getValue() + "_g" + std::to_string(next++)));
-        // Avoid collision with any existing mapping earlier.
-        bool collision = false;
-        if (auto existing = op.getInnerSymAttr()) {
-          for (auto p : existing.getProps())
-            if (p.getName() == newName) {
-              collision = true;
-              break;
-            }
-        }
-        if (!collision)
-          break;
-      }
-      auto oldName = op.getInnerSymAttr().getSymIfExists(0);
-      renameMap[op] = newName;
-      oldToNew[{pair.first.getSymNameAttr(), oldName}] = newName;
+            ctx, (base.getValue() + "_g" + std::to_string(counter++)));
+      } while (newName == base);
+      renameMap[vec[i]] = newName;
     }
   }
 
   if (renameMap.empty())
-    return; // Nothing to do.
+    return;
 
-  // Apply renames to the ops.
-  for (auto &it : renameMap) {
-    auto op = it.first;
-    auto newName = it.second;
-    auto inner = op.getInnerSymAttr();
-    auto oldName = inner.getSymIfExists(0);
-    auto newAttr = rewriteSingle(inner, oldName, newName);
-    op.setInnerSymbolAttr(newAttr);
-  }
-
-  // Update hierpath operands referencing renamed inner syms.
-  for (auto hp : hierPaths) {
+  // Apply changes per op: rebuild InnerSymAttr if any of its properties
+  // renamed.
+  for (auto &pair : ifaceList) {
+    auto mod = pair.first;
+    (void)mod; // reserved for future filtering
+    auto iface = pair.second;
+    auto oldAttr = iface.getInnerSymAttr();
+    if (!oldAttr)
+      continue;
     bool changed = false;
-    SmallVector<Attribute> newPath;
-    newPath.reserve(hp.getNamepath().size());
-    for (auto attr : hp.getNamepath()) {
-      if (auto ir = dyn_cast<InnerRefAttr>(attr)) {
-        if (auto it = oldToNew.find({ir.getModule(), ir.getName()});
-            it != oldToNew.end()) {
-          changed = true;
-          attr = InnerRefAttr::get(ir.getModule(), it->second);
-        }
+    SmallVector<InnerSymPropertiesAttr> newProps;
+    newProps.reserve(oldAttr.getProps().size());
+    for (auto en : llvm::enumerate(oldAttr.getProps())) {
+      auto key = std::make_tuple(pair.first, iface, (unsigned)en.index());
+      if (auto it = renameMap.find(key); it != renameMap.end()) {
+        changed = true;
+        newProps.push_back(InnerSymPropertiesAttr::get(
+            oldAttr.getContext(), it->second, en.value().getFieldID(),
+            en.value().getSymVisibility()));
+      } else {
+        newProps.push_back(en.value());
       }
-      newPath.push_back(attr);
     }
     if (changed)
-      hp.setNamepathAttr(ArrayAttr::get(ctx, newPath));
+      iface.setInnerSymbolAttr(
+          InnerSymAttr::get(oldAttr.getContext(), newProps));
   }
 }
-
-// TODO: We currently do not update sv.xmrref because they refer through
-// hierpath.
+// HierPaths 已在前置 pass 中处理并移除，本 pass 不再更新引用。
