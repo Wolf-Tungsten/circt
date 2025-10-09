@@ -704,6 +704,9 @@ LogicalResult processBuffer(
     pm.addPass(hw::createHWGlobalUniqueInnerSym());
     pm.addPass(sv::createSVExtractTestCodePass(false, true, false));
     pm.addPass(hw::createHWStripExternalModule());
+    pm.addPass(hw::createHWCombmemToReg());
+    pm.addPass(
+        hw::createHWReduceMemReadLatency(hw::HWReduceMemReadLatencyOptions{1}));
   }
   // Corvus Compiler Pass End
 
