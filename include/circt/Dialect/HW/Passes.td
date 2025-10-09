@@ -114,11 +114,16 @@ def HWStripExternalModule: Pass<"hw-strip-external-module", "mlir::ModuleOp"> {
     their internal counterparts.
   }];
 }
-def HWSeqmemToCombmem : Pass<"hw-seqmem-to-combmem", "mlir::ModuleOp"> {
-  let summary = "Convert all SeqMem to CombMem";
+
+def HWReduceMemReadLatency : Pass<"hw-reduce-mem-read-latency", "mlir::ModuleOp"> {
+  let summary = "Reduce FirMem read latency with extra FirReg";
   let description = [{
-    This pass convert `seq.firmem` with readLatency > 0 to 0 with extra `seq.firreg`.
+    This pass reduce `seq.firmem` with readLatency > N to N with extra `seq.firreg`.
   }];
+  let options = [
+    Option<"latency", "latency", "uint32_t", "1",
+      "Target read latency (default: 1)">
+  ];
 }
 
 def HWAssignUniqueInnerSym : Pass<"hw-assign-unique-inner-sym", "mlir::ModuleOp"> {
@@ -185,6 +190,14 @@ def HWGlobalUniqueInnerSym : Pass<"hw-global-unique-inner-sym", "mlir::ModuleOp"
     (e.g. `hw.hierpath`) that references an affected inner symbol through an
     `InnerRefAttr` is updated to point at the new name.
   }];
+}
+
+def HWCombmemToReg : Pass<"hw-combmem-to-reg", "mlir::ModuleOp"> {
+  let summary = "Convert combmem to register";
+  let description = [{
+    This pass convert firmem with readLatency=0 and related read/write operations to firreg
+  }];
+  let dependentDialects = ["comb::CombDialect"];
 }
 
 #endif // CIRCT_DIALECT_HW_PASSES_TD
