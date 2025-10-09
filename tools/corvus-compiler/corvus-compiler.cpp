@@ -121,6 +121,11 @@ cl::opt<bool>
                  cl::desc("Run the verifier after each transformation pass"),
                  cl::init(true), cl::cat(mainCategory));
 
+cl::opt<bool> disableCorvusPass(
+    "disable-corvus-pass",
+    cl::desc("Skip the Corvus Compiler pass pipeline"),
+    cl::init(false), cl::cat(mainCategory));
+
 cl::opt<std::string>
     hwOutFile("output-hw-mlir",
               cl::desc("Optional file name to output the HW IR into, in "
@@ -687,18 +692,20 @@ LogicalResult processBuffer(
   // Lower if we are going to verilog or if lowering was specifically
   // requested.
 
-  // Corvus Compiler Pass Start
-
   pm.nestAny().addPass(verif::createStripContractsPass());
   pm.addPass(verif::createLowerFormalToHWPass());
   pm.addPass(verif::createLowerSymbolicValuesPass(
       {corvusCompilerOptions.getSymbolicValueLowering()}));
-  pm.addPass(hw::createHWEliminateHierPath());
-  pm.addPass(hw::createFlattenModules());
-  pm.addPass(hw::createHWGlobalUniqueInnerSym());
-  pm.addPass(sv::createSVExtractTestCodePass(false, true, false));
-  pm.addPass(hw::createHWStripExternalModule());
-  //      Corvus Compiler Pass End
+
+  // Corvus Compiler Pass Start
+  if (!disableCorvusPass) {
+    pm.addPass(hw::createHWEliminateHierPath());
+    pm.addPass(hw::createFlattenModules());
+    pm.addPass(hw::createHWGlobalUniqueInnerSym());
+    pm.addPass(sv::createSVExtractTestCodePass(false, true, false));
+    pm.addPass(hw::createHWStripExternalModule());
+  }
+  // Corvus Compiler Pass End
 
   // If requested, emit the HW IR to hwOutFile.
   if (!hwOutFile.empty())
