@@ -1,11 +1,19 @@
-//===- FooWires.cpp - Replace all wire names with foo ------*- C++ -*-===//
+//===- HWStripExternalModule.cpp - Corvus module splitting -*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 //
-// Replace all wire names with foo.
+// This pass splits the single public HW module (user_top) into three modules
+// tailored for the Corvus flow:
+//   * corvus_top (private) retains user logic but surfaces every instance
+//     connection through explicit ports.
+//   * corvus_external (private) contains only the extracted instances and the
+//     matching bridge ports.
+//   * corvus_wrapper_t0 (public) instantiates the two private modules, wires
+//     the bridge ports, and preserves the original IO signature and behaviour.
+// All sv.bind ops are removed to avoid dangling references to erased logic.
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,10 +21,12 @@
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/SV/SVOps.h"
-#include "circt/Dialect/Seq/SeqOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
-#include <ranges>
-#include <unordered_map>
+#include "circt/Support/BackedgeBuilder.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
 
 namespace circt {
 namespace hw {
@@ -29,225 +39,307 @@ using namespace circt;
 using namespace hw;
 
 namespace {
-// A test pass that simply replaces all wire names with foo_<n>
-struct HWStripExternalModule
-    : circt::hw::impl::HWStripExternalModuleBase<HWStripExternalModule> {
 
-  void runOnOperation() override;
-  ModuleOp mlirModuleOp;
-  hw::HWModuleOp srcHWModuleOp;
-  hw::HWModuleOp dstHWModuleOp;
-
-  llvm::SmallVector<Operation *, 4> srcToErase;
-  llvm::SmallVector<std::pair<std::string, Value>, 4> srcToOutputValues;
-  llvm::SmallVector<std::pair<std::string, Value>, 4> srcToInputValues;
-
-  llvm::SmallVector<Operation *, 4> dstToErase;
-  llvm::SmallVector<std::pair<std::string, Value>, 4> dstToOutputValues;
-  llvm::SmallVector<std::pair<std::string, Value>, 4> dstToInputValues;
-
-  LogicalResult processSrcHWModule();
-  LogicalResult processDstHWModule();
-  std::string
-  portNameGuard(std::string expectedPortName, hw::HWModuleOp moduleOp,
-                llvm::ArrayRef<std::pair<std::string, Value>> existingPorts);
+struct BridgePort {
+  std::string name;
+  Type type;
 };
+
+static std::string makeUniqueName(StringRef base, llvm::StringSet<> &used) {
+  std::string candidate = base.str();
+  unsigned suffix = 0;
+  while (used.contains(candidate))
+    candidate = (base + "_" + Twine(++suffix)).str();
+  used.insert(candidate);
+  return candidate;
+}
+
+class HWStripExternalModule
+    : public hw::impl::HWStripExternalModuleBase<HWStripExternalModule> {
+public:
+  void runOnOperation() override;
+
+private:
+  LogicalResult rewriteCorvusTop(hw::HWModuleOp corvusTop);
+  LogicalResult rewriteCorvusExternal(hw::HWModuleOp corvusExternal);
+  LogicalResult rewriteCorvusWrapper(hw::HWModuleOp corvusWrapper,
+                                     hw::HWModuleOp corvusTop,
+                                     hw::HWModuleOp corvusExternal);
+
+  LogicalResult ensureSymbolFree(StringRef symbol);
+
+  ModuleOp mlirModuleOp;
+  SmallVector<BridgePort, 8> bridgeOperandPorts;
+  SmallVector<BridgePort, 8> bridgeResultPorts;
+  unsigned originalInputCount = 0;
+  unsigned originalOutputCount = 0;
+};
+
 } // namespace
 
 void HWStripExternalModule::runOnOperation() {
-  auto module = getOperation();
-  mlirModuleOp = module;
-  module.walk([&](hw::HWModuleOp hwModule) {
-    if (hwModule.isPrivate()) {
-      return; // 只处理顶层模块
-    }
-    // 对于每个 hwModule 单独处理
-    srcHWModuleOp = hwModule;
-    // 在 module 中，克隆一个 srcHWModuleOp，作为 dstHWModuleOp
-    OpBuilder builder(module.getBodyRegion());
-    dstHWModuleOp = srcHWModuleOp.clone();
-    std::string newName = (dstHWModuleOp.getName() + "_corvus_external").str();
-    dstHWModuleOp.setSymNameAttr(builder.getStringAttr(newName));
-    dstHWModuleOp.setPrivate();
-    // dstHWModuleOp 添加一个 corvus_external 属性
-    dstHWModuleOp->setAttr("corvus_external", builder.getUnitAttr());
-    // srcHWModuleOp 添加一个 corvus_top 属性
-    srcHWModuleOp->setAttr("corvus_top", builder.getUnitAttr());
-    builder.insert(dstHWModuleOp);
-    // 处理 srcHWModuleOp
-    if (failed(processSrcHWModule())) {
+  mlirModuleOp = getOperation();
+  bridgeOperandPorts.clear();
+  bridgeResultPorts.clear();
+
+  hw::HWModuleOp userTop;
+  for (auto hwModule : mlirModuleOp.getOps<hw::HWModuleOp>()) {
+    if (hwModule.isPrivate())
+      continue;
+    if (userTop) {
+      hwModule.emitOpError(
+          "HWStripExternalModule expects exactly one public hw.module");
       signalPassFailure();
       return;
     }
-    // 处理 dstHWModuleOp
-    if (failed(processDstHWModule())) {
-      signalPassFailure();
-      return;
-    }
-    srcToErase.clear();
-    srcToInputValues.clear();
-    srcToOutputValues.clear();
-    dstToErase.clear();
-    dstToInputValues.clear();
-    dstToOutputValues.clear();
-  });
-  // 删除多余的 sv.bind
-  llvm::SmallVector<sv::BindOp, 4> svBindOps;
-  for (auto svBindOp : module.getOps<sv::BindOp>()) {
-    svBindOps.push_back(svBindOp);
+    userTop = hwModule;
   }
-  for (auto svBindOp : svBindOps) {
-    svBindOp.erase();
+
+  if (!userTop) {
+    mlirModuleOp.emitError(
+        "HWStripExternalModule requires a public hw.module to split");
+    signalPassFailure();
+    return;
   }
+
+  originalInputCount = userTop.getNumInputPorts();
+  originalOutputCount = userTop.getNumOutputPorts();
+
+  if (failed(ensureSymbolFree("corvus_top")) ||
+      failed(ensureSymbolFree("corvus_external")) ||
+      failed(ensureSymbolFree("corvus_wrapper_t0"))) {
+    signalPassFailure();
+    return;
+  }
+
+  OpBuilder moduleBuilder(mlirModuleOp.getBodyRegion());
+  moduleBuilder.setInsertionPointAfter(userTop);
+
+  Operation *externalCloneOp = userTop.clone();
+  auto corvusExternal = cast<hw::HWModuleOp>(externalCloneOp);
+  corvusExternal.setSymNameAttr(moduleBuilder.getStringAttr("corvus_external"));
+  moduleBuilder.insert(corvusExternal);
+
+  moduleBuilder.setInsertionPointAfter(corvusExternal);
+  Operation *wrapperCloneOp = userTop.clone();
+  auto corvusWrapper = cast<hw::HWModuleOp>(wrapperCloneOp);
+  corvusWrapper.setSymNameAttr(
+      moduleBuilder.getStringAttr("corvus_wrapper_t0"));
+  moduleBuilder.insert(corvusWrapper);
+
+  userTop.setSymNameAttr(moduleBuilder.getStringAttr("corvus_top"));
+  userTop.setPrivate();
+  userTop->setAttr("corvus_top", moduleBuilder.getUnitAttr());
+
+  corvusExternal.setPrivate();
+  corvusExternal->setAttr("corvus_external", moduleBuilder.getUnitAttr());
+
+  corvusWrapper.setPublic();
+
+  if (failed(rewriteCorvusTop(userTop)) ||
+      failed(rewriteCorvusExternal(corvusExternal)) ||
+      failed(rewriteCorvusWrapper(corvusWrapper, userTop, corvusExternal))) {
+    signalPassFailure();
+    return;
+  }
+
+  SmallVector<sv::BindOp> binds;
+  for (auto bindOp : mlirModuleOp.getOps<sv::BindOp>())
+    binds.push_back(bindOp);
+  for (auto bindOp : binds)
+    bindOp.erase();
 }
 
-LogicalResult HWStripExternalModule::processSrcHWModule() {
-  // 遍历所有的 hw.instance
-  for (hw::InstanceOp instanceOp : srcHWModuleOp.getOps<hw::InstanceOp>()) {
-    auto instanceName = instanceOp.getInstanceName().str();
-    // 遍历 instanceOp 的所有输入，将其添加到src模块的输出接口
-    for (unsigned int i = 0; i < instanceOp.getNumOperands(); i++) {
-      auto operand = instanceOp.getOperand(i);
-      std::string outputName = "extp_";
-      outputName += instanceName;
-      outputName += "_in_";
-      outputName += std::to_string(i);
-      outputName = portNameGuard(outputName, srcHWModuleOp,
-                                 srcToOutputValues); // 避免重名
-      srcToOutputValues.push_back({outputName, operand});
-    }
-    // 遍历 instanceOp 的所有输出，将其添加到src模块的输入接口
-    for (unsigned int i = 0; i < instanceOp.getNumResults(); i++) {
-      auto result = instanceOp.getResult(i);
-      std::string inputName = "extp_";
-      inputName += instanceName;
-      inputName += "_out_";
-      inputName += std::to_string(i);
-      inputName = portNameGuard(inputName, srcHWModuleOp,
-                                srcToInputValues); // 避免重名
-      srcToInputValues.push_back({inputName, result});
-    }
-    // 将 instanceOp 标记为待删除
-    srcToErase.push_back(instanceOp);
+LogicalResult
+HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
+  bridgeOperandPorts.clear();
+  bridgeResultPorts.clear();
+
+  llvm::StringSet<> usedInputNames;
+  llvm::StringSet<> usedOutputNames;
+  for (auto port : corvusTop.getPortList()) {
+    std::string name = port.name.getValue().str();
+    if (port.isOutput())
+      usedOutputNames.insert(name);
+    else
+      usedInputNames.insert(name);
   }
 
-  // 添加新的输入输出端口
-  for (auto [name, value] : srcToOutputValues) {
-    srcHWModuleOp.appendOutput(name, value);
+  SmallVector<hw::InstanceOp, 8> instances;
+  for (auto instance : corvusTop.getOps<hw::InstanceOp>())
+    instances.push_back(instance);
+
+  for (auto instance : instances) {
+    auto instanceName = instance.getInstanceName().str();
+
+    for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
+      std::string base = ("extp_" + instanceName + "_in_" + Twine(idx)).str();
+      std::string uniqueName = makeUniqueName(base, usedOutputNames);
+      corvusTop.appendOutput(uniqueName, operand);
+      bridgeOperandPorts.push_back({uniqueName, operand.getType()});
+    }
+
+    for (auto [idx, result] : llvm::enumerate(instance.getResults())) {
+      std::string base = ("extp_" + instanceName + "_out_" + Twine(idx)).str();
+      std::string uniqueName = makeUniqueName(base, usedInputNames);
+      auto [nameAttr, blockArg] =
+          corvusTop.appendInput(uniqueName, result.getType());
+      (void)nameAttr;
+      result.replaceAllUsesWith(blockArg);
+      bridgeResultPorts.push_back({uniqueName, blockArg.getType()});
+    }
   }
-  for (auto [name, value] : srcToInputValues) {
-    auto [portName, blockArgument] =
-        srcHWModuleOp.appendInput(name, value.getType());
-    value.replaceAllUsesWith(blockArgument);
-  }
-  // 删除所有标记的操作
-  for (auto op : llvm::reverse(srcToErase)) {
-    op->erase(); // 现在才能安全释放
-  }
+
+  for (auto instance : llvm::reverse(instances))
+    instance.erase();
+
   return success();
 }
 
-LogicalResult HWStripExternalModule::processDstHWModule() {
-  auto terminatorOp = dstHWModuleOp.getBody().front().getTerminator();
-  // step 1. 收集所有需要添加的接口、需要删除的 op
-  for (auto &block : dstHWModuleOp.getBody().getBlocks()) {
-    for (auto &op : block.getOperations()) {
-      if (isa<hw::InstanceOp>(op)) {
-        // 处理输入，如果输入是来自 op 的，则添加成输入
-        auto instanceOp = cast<hw::InstanceOp>(op);
-        auto instanceName = instanceOp.getInstanceName().str();
-        for (unsigned int i = 0; i < instanceOp.getNumOperands(); i++) {
-          auto operand = instanceOp.getOperand(i);
-          std::string inputName = "extp_";
-          inputName += instanceName;
-          inputName += "_in_";
-          inputName += std::to_string(i);
-          inputName = portNameGuard(inputName, dstHWModuleOp, dstToInputValues);
-          dstToInputValues.push_back({inputName, operand});
-        }
-        // 处理输出，如果输出是被 op 使用的，则添加成输出
-        for (unsigned int i = 0; i < instanceOp.getNumResults(); i++) {
-          auto result = instanceOp.getResult(i);
-          std::string outputName = "extp_";
-          outputName += instanceName;
-          outputName += "_out_";
-          outputName += std::to_string(i);
-          outputName =
-              portNameGuard(outputName, dstHWModuleOp, dstToOutputValues);
-          dstToOutputValues.push_back({outputName, result});
-        }
-      } else {
-        // 其他操作除了 terminator 都删除
-        if (&op != dstHWModuleOp.getBody().front().getTerminator()) {
-          dstToErase.push_back(&op);
-        }
+LogicalResult
+HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
+  Block &block = corvusExternal.getBody().front();
+  auto *terminator = block.getTerminator();
+
+  unsigned originalInputs = corvusExternal.getNumInputPorts();
+  unsigned originalOutputs = corvusExternal.getNumOutputPorts();
+
+  SmallVector<hw::InstanceOp, 8> instances;
+  for (auto instance : block.getOps<hw::InstanceOp>())
+    instances.push_back(instance);
+
+  unsigned operandCursor = 0;
+  for (auto instance : instances) {
+    for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
+      if (operandCursor >= bridgeOperandPorts.size()) {
+        instance.emitOpError("operand bridge information missing");
+        return failure();
       }
+      const BridgePort &port = bridgeOperandPorts[operandCursor++];
+      auto [nameAttr, blockArg] =
+          corvusExternal.appendInput(port.name, port.type);
+      (void)nameAttr;
+      instance.setOperand(idx, blockArg);
     }
   }
-  // step 2. 记录原有接口数量
-  unsigned int originalInputNum = dstHWModuleOp.getNumInputPorts();
-  unsigned int originalOutputNum = dstHWModuleOp.getNumOutputPorts();
-  llvm::SmallVector<unsigned, 4> inputIndicesToRemove;
-  llvm::SmallVector<unsigned, 4> outputIndicesToRemove;
-  for (unsigned i = 0; i < originalOutputNum; i++) {
-    outputIndicesToRemove.push_back(i);
-  }
-  for (unsigned i = 0; i < originalInputNum; i++) {
-    inputIndicesToRemove.push_back(i);
-  }
 
-  // step 3. 将原有输出端口都删除
-  terminatorOp->eraseOperands(0, originalOutputNum);
-  dstHWModuleOp.erasePorts({}, outputIndicesToRemove);
-
-  // step 4. 添加输出端口
-  for (auto [name, value] : dstToOutputValues) {
-    dstHWModuleOp.appendOutput(name, value);
+  unsigned resultCursor = 0;
+  for (auto instance : instances) {
+    for (auto [idx, result] : llvm::enumerate(instance.getResults())) {
+      if (resultCursor >= bridgeResultPorts.size()) {
+        instance.emitOpError("result bridge information missing");
+        return failure();
+      }
+      const BridgePort &port = bridgeResultPorts[resultCursor++];
+      corvusExternal.appendOutput(port.name, result);
+    }
   }
 
-  // step 5. 添加输入端口
-  for (auto [name, value] : dstToInputValues) {
-    auto [portName, blockArgument] =
-        dstHWModuleOp.appendInput(name, value.getType());
-    value.replaceAllUsesWith(blockArgument);
+  SmallVector<Operation *, 8> toErase;
+  for (auto &op : block.getOperations()) {
+    if (isa<hw::InstanceOp>(op) || &op == terminator)
+      continue;
+    toErase.push_back(&op);
   }
-
-  // step 6. 删除所有标记的操作
-  for (auto op : dstToErase) {
+  for (auto *op : toErase) {
     op->dropAllUses();
-    op->erase(); // 现在才能安全释放
+    op->erase();
   }
 
-  // step 7. 删除所有原有输入端口
-  dstHWModuleOp.erasePorts(inputIndicesToRemove, {});
-  dstHWModuleOp.getBody().front().eraseArguments(0, originalInputNum);
+  if (originalOutputs) {
+    terminator->eraseOperands(0, originalOutputs);
+  }
+
+  SmallVector<unsigned, 8> inputIndicesToRemove;
+  for (unsigned i = 0; i < originalInputs; ++i)
+    inputIndicesToRemove.push_back(i);
+
+  SmallVector<unsigned, 8> outputIndicesToRemove;
+  for (unsigned i = 0; i < originalOutputs; ++i)
+    outputIndicesToRemove.push_back(i);
+
+  if (!inputIndicesToRemove.empty() || !outputIndicesToRemove.empty())
+    corvusExternal.erasePorts(inputIndicesToRemove, outputIndicesToRemove);
+
+  if (originalInputs)
+    block.eraseArguments(0, originalInputs);
+
   return success();
 }
 
-std::string HWStripExternalModule::portNameGuard(
-    std::string expectedPortName, hw::HWModuleOp moduleOp,
-    llvm::ArrayRef<std::pair<std::string, Value>> existingPorts) {
-  std::string portName = expectedPortName;
-  int suffix = 0;
-  bool conflict = true;
-  while (conflict) {
-    conflict = false;
-    // 是否和马上添加的port重复？
-    for (auto [existingPortName, _] : existingPorts) {
-      if (existingPortName == portName) {
-        conflict = true;
-        portName = expectedPortName + "_" + std::to_string(suffix++);
-        break;
-      }
-    }
-    // 是否和 moduleOp 里已有的 port 重复？
-    for (auto port : moduleOp.getPortList()) {
-      if (port.name == portName) {
-        conflict = true;
-        portName = expectedPortName + "_" + std::to_string(suffix++);
-        break;
-      }
-    }
+LogicalResult
+HWStripExternalModule::rewriteCorvusWrapper(hw::HWModuleOp corvusWrapper,
+                                            hw::HWModuleOp corvusTop,
+                                            hw::HWModuleOp corvusExternal) {
+  Block &block = corvusWrapper.getBody().front();
+  auto *terminator = block.getTerminator();
+
+  SmallVector<Operation *, 8> toErase;
+  for (auto &op : block.getOperations()) {
+    if (&op == terminator)
+      continue;
+    toErase.push_back(&op);
   }
-  return portName;
+  for (auto *op : toErase) {
+    op->dropAllUses();
+    op->erase();
+  }
+
+  OpBuilder bodyBuilder(terminator);
+  auto loc = corvusWrapper.getLoc();
+
+  SmallVector<Value> corvusTopInputs;
+  corvusTopInputs.reserve(corvusTop.getNumInputPorts());
+
+  for (unsigned i = 0; i < originalInputCount; ++i)
+    corvusTopInputs.push_back(block.getArgument(i));
+
+  BackedgeBuilder edgeBuilder(bodyBuilder, loc);
+  SmallVector<Backedge, 8> bridgeBackedges;
+  bridgeBackedges.reserve(bridgeResultPorts.size());
+  for (const BridgePort &port : bridgeResultPorts) {
+    Backedge edge = edgeBuilder.get(port.type);
+    bridgeBackedges.push_back(edge);
+    corvusTopInputs.push_back(edge);
+  }
+
+  auto corvusTopInst = bodyBuilder.create<hw::InstanceOp>(
+      loc, corvusTop.getOperation(),
+      bodyBuilder.getStringAttr("corvus_top_inst"), corvusTopInputs);
+
+  SmallVector<Value> corvusExternalInputs;
+  corvusExternalInputs.reserve(bridgeOperandPorts.size());
+  for (unsigned i = 0, e = bridgeOperandPorts.size(); i < e; ++i)
+    corvusExternalInputs.push_back(
+        corvusTopInst.getResult(originalOutputCount + i));
+
+  auto corvusExternalInst = bodyBuilder.create<hw::InstanceOp>(
+      loc, corvusExternal.getOperation(),
+      bodyBuilder.getStringAttr("corvus_external_inst"), corvusExternalInputs);
+
+  for (auto [idx, edge] : llvm::enumerate(bridgeBackedges))
+    edge.setValue(corvusExternalInst.getResult(idx));
+
+  if (failed(edgeBuilder.clearOrEmitError()))
+    return failure();
+
+  SmallVector<Value> wrapperOutputs;
+  wrapperOutputs.reserve(originalOutputCount);
+  for (unsigned i = 0; i < originalOutputCount; ++i)
+    wrapperOutputs.push_back(corvusTopInst.getResult(i));
+
+  bodyBuilder.create<hw::OutputOp>(loc, wrapperOutputs);
+  terminator->erase();
+
+  return success();
+}
+
+LogicalResult HWStripExternalModule::ensureSymbolFree(StringRef symbol) {
+  if (mlirModuleOp.lookupSymbol(symbol)) {
+    mlirModuleOp.emitError()
+        << "HWStripExternalModule cannot reuse existing symbol '" << symbol
+        << "'";
+    return failure();
+  }
+  return success();
 }
