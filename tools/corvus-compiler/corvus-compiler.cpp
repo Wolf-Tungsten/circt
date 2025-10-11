@@ -251,6 +251,10 @@ struct CorvusCompilerCmdOptions {
       "export-module-hierarchy",
       llvm::cl::desc("Export module and instance hierarchy as JSON"),
       llvm::cl::init(false)};
+  llvm::cl::opt<unsigned> repcutNumPartitions{
+      "repcut-num-partitions",
+      llvm::cl::desc("Number of partitions for the HW RepCut pass"),
+      llvm::cl::init(8)};
 };
 
 llvm::ManagedStatic<CorvusCompilerCmdOptions> clOptions;
@@ -273,7 +277,8 @@ public:
         ignoreReadEnableMem(false), addMuxPragmas(false),
         addVivadoRAMAddressConflictSynthesisBugWorkaround(false),
         disableOptimization(false), stripFirDebugInfo(true),
-        stripDebugInfo(false), exportModuleHierarchy(false) {
+        stripDebugInfo(false), exportModuleHierarchy(false),
+        repcutNumPartitions(8) {
     if (!clOptions.isConstructed())
       return;
     outputFilename = clOptions->outputFilename;
@@ -293,6 +298,7 @@ public:
     stripFirDebugInfo = clOptions->stripFirDebugInfo;
     stripDebugInfo = clOptions->stripDebugInfo;
     exportModuleHierarchy = clOptions->exportModuleHierarchy;
+    repcutNumPartitions = clOptions->repcutNumPartitions;
   }
   StringRef getOutputFilename() const { return outputFilename; }
   bool isDefaultOutputFilename() const { return outputFilename == "-"; }
@@ -328,6 +334,7 @@ public:
   bool shouldStripFirDebugInfo() const { return stripFirDebugInfo; }
   bool shouldStripDebugInfo() const { return stripDebugInfo; }
   bool shouldExportModuleHierarchy() const { return exportModuleHierarchy; }
+  unsigned getRepCutNumPartitions() const { return repcutNumPartitions; }
 
 private:
   std::string outputFilename;
@@ -346,6 +353,7 @@ private:
   bool stripFirDebugInfo;
   bool stripDebugInfo;
   bool exportModuleHierarchy;
+  unsigned repcutNumPartitions;
 };
 
 namespace detail {
@@ -711,6 +719,11 @@ LogicalResult processBuffer(
     hw::HWInsertWiresOptions insertWiresOptions;
     insertWiresOptions.moduleName = "corvus_top";
     hwModulePM.addPass(hw::createHWInsertWires(insertWiresOptions));
+    hw::HWRepCutOptions repcutOptions;
+    repcutOptions.moduleName = "corvus_top";
+    repcutOptions.numPartitions =
+        corvusCompilerOptions.getRepCutNumPartitions();
+    hwModulePM.addPass(hw::createHWRepCut(repcutOptions));
   }
   // Corvus Compiler Pass End
 
