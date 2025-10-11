@@ -40,10 +40,15 @@ logic while the original interface is preserved through a wrapper.
    - Sequential ops are `seq::FirRegOp`, `seq::FirMemReadOp`,
      `seq::FirMemWriteOp`, and `seq::FirMemReadWriteOp`. Their accompanying
      `seq::FirMemOp` declarations are considered state anchors.
-   - For each operand, append a new input port named `s_in_<N>` unless the
-     operand is a constant or a memory declaration handle. Uses of the operand
-     are rewritten to the newly created block argument.
-   - For each result, append a new output port named `s_out_<N>`.
+   - For each operand, append a new input port derived from the operand's
+     origin (register or memory) unless the operand is a constant or a memory
+     declaration handle. Uses of the operand are rewritten to the newly created
+     block argument.
+   - For each result, append a new output port named after the producing
+     register or memory value.
+   - Port names inherit the source register or memory identifier (or inner
+     symbol) and use suffixes such as `_d`, `_clk`, `_en`, `_addr`, `_q`, etc.,
+     to capture the signal role for readability.
 3. Collect and erase every operation that is neither a sequential boundary op,
    a `seq::FirMemOp`, an `hw::ConstantOp`, nor the final `hw.output`. The body
    is reduced to state operations plus constants.
@@ -55,10 +60,11 @@ logic while the original interface is preserved through a wrapper.
 1. Cache all sequential boundary ops and `seq::FirMemOp` declarations before
    mutating the body.
 2. For each operand of the cached sequential ops, append a port named
-   `to_s_<N>`. These ports drive the matching inputs on `<orig>_S`.
-3. For each result of the cached sequential ops, append a port named
-   `from_s_<N>`, and replace every SSA use of that result with the new block
-   argument. These inputs receive state outputs from `<orig>_S`.
+   using the same naming scheme as in `<orig>_S`. These ports drive the matching
+   inputs on `<orig>_S`.
+3. For each result of the cached sequential ops, append a port named using the
+   corresponding result name, and replace every SSA use of that result with the
+   new block argument. These inputs receive state outputs from `<orig>_S`.
 4. Erase the sequential ops and memory declarations from the body. The
    remaining operations are combinational (plus any constants).
 5. Original inputs and outputs are retained so `__corvus_comb` still conforms to

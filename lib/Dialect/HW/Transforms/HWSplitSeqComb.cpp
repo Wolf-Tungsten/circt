@@ -21,6 +21,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/Seq/SeqOps.h"
@@ -29,7 +30,9 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include <numeric>
+#include <cctype>
 
 #define DEBUG_TYPE "hw-split-seq-comb"
 
@@ -54,34 +57,185 @@ static bool isSeqBoundaryOp(Operation *op) {
 
 static bool isConst(Value v) { return v.getDefiningOp<hw::ConstantOp>(); }
 
-// Collect a unique input for a given value if not yet present.
-// Returns the index in the collection, or the existing mapped value's index.
+static std::string sanitizePortComponent(StringRef raw) {
+  std::string result;
+  result.reserve(raw.size());
+  for (char ch : raw) {
+    unsigned char c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c) || ch == '_')
+      result.push_back(ch);
+    else
+      result.push_back('_');
+  }
+  if (result.empty())
+    return "";
+  if (std::isdigit(static_cast<unsigned char>(result.front())))
+    result.insert(result.begin(), '_');
+  return result;
+}
+
+static std::string
+makeUniquePortName(StringRef desired, StringRef fallback,
+                   llvm::StringSet<> &usedNames) {
+  std::string base = sanitizePortComponent(desired);
+  if (base.empty())
+    base = sanitizePortComponent(fallback);
+  if (base.empty())
+    base = "port";
+
+  std::string name = base;
+  unsigned suffix = 0;
+  while (usedNames.contains(name))
+    name = base + "_" + std::to_string(++suffix);
+  usedNames.insert(name);
+  return name;
+}
+
+static std::string getRegEntityName(seq::FirRegOp reg) {
+  StringRef name = reg.getName();
+  if (!name.empty())
+    return name.str();
+  if (auto innerSym = reg.getInnerSymAttr())
+    if (auto symName = innerSym.getSymName())
+      if (!symName.getValue().empty())
+        return symName.getValue().str();
+  return "anon_reg";
+}
+
+static std::string getMemEntityName(Value memVal) {
+  if (auto memOp = memVal.getDefiningOp<seq::FirMemOp>()) {
+    if (auto nameOpt = memOp.getName())
+      if (!nameOpt->empty())
+        return nameOpt->str();
+    if (auto innerSymOpt = memOp.getInnerSym())
+      if (auto symName = innerSymOpt->getSymName())
+        if (!symName.getValue().empty())
+          return symName.getValue().str();
+  }
+  return "anon_mem";
+}
+
+static std::string getSeqMemPortPrefix(Operation *op, Value memVal) {
+  std::string base = getMemEntityName(memVal);
+  if (isa<seq::FirMemReadOp>(op))
+    return base + "_rd";
+  if (isa<seq::FirMemWriteOp>(op))
+    return base + "_wr";
+  if (isa<seq::FirMemReadWriteOp>(op))
+    return base + "_rw";
+  return base;
+}
+
+static std::string getSeqOperandPortName(Operation *op, OpOperand &operand) {
+  Value val = operand.get();
+  if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+    std::string base = getRegEntityName(reg);
+    if (val == reg.getNext())
+      return base + "_d";
+    if (val == reg.getClk())
+      return base + "_clk";
+    Value reset = reg.getReset();
+    if (reset && val == reset)
+      return base + "_rst";
+    Value resetVal = reg.getResetValue();
+    if (resetVal && val == resetVal)
+      return base + "_rstval";
+    return base + "_in";
+  }
+
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+    std::string prefix = getSeqMemPortPrefix(op, read.getMemory());
+    if (val == read.getAddress())
+      return prefix + "_addr";
+    if (val == read.getClk())
+      return prefix + "_clk";
+    Value en = read.getEnable();
+    if (en && val == en)
+      return prefix + "_en";
+    return prefix + "_in";
+  }
+
+  if (auto write = dyn_cast<seq::FirMemWriteOp>(op)) {
+    std::string prefix = getSeqMemPortPrefix(op, write.getMemory());
+    if (val == write.getAddress())
+      return prefix + "_addr";
+    if (val == write.getClk())
+      return prefix + "_clk";
+    Value en = write.getEnable();
+    if (en && val == en)
+      return prefix + "_en";
+    if (val == write.getData())
+      return prefix + "_d";
+    Value mask = write.getMask();
+    if (mask && val == mask)
+      return prefix + "_mask";
+    return prefix + "_in";
+  }
+
+  if (auto readWrite = dyn_cast<seq::FirMemReadWriteOp>(op)) {
+    std::string prefix = getSeqMemPortPrefix(op, readWrite.getMemory());
+    if (val == readWrite.getAddress())
+      return prefix + "_addr";
+    if (val == readWrite.getClk())
+      return prefix + "_clk";
+    Value en = readWrite.getEnable();
+    if (en && val == en)
+      return prefix + "_en";
+    if (val == readWrite.getWriteData())
+      return prefix + "_wd";
+    if (val == readWrite.getMode())
+      return prefix + "_mode";
+    Value mask = readWrite.getMask();
+    if (mask && val == mask)
+      return prefix + "_mask";
+    return prefix + "_in";
+  }
+
+  return "";
+}
+
+static std::string getSeqResultPortName(Operation *op, unsigned resultIndex) {
+  (void)resultIndex;
+  if (auto reg = dyn_cast<seq::FirRegOp>(op))
+    return getRegEntityName(reg) + "_q";
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+    return getSeqMemPortPrefix(op, read.getMemory()) + "_data";
+  if (auto readWrite = dyn_cast<seq::FirMemReadWriteOp>(op))
+    return getSeqMemPortPrefix(op, readWrite.getMemory()) + "_rdata";
+  return "";
+}
+
 static size_t
 collectUniqueInput(DenseMap<Value, size_t> &map,
                    SmallVector<std::pair<StringAttr, Type>> &inputs, Value v,
-                   StringRef baseName, MLIRContext *ctx) {
-  if (auto it = map.find(v); it != map.end())
-    return it->second; // Return existing index
+                   llvm::StringSet<> &usedNames, MLIRContext *ctx,
+                   StringRef desiredName, StringRef fallbackPrefix,
+                   bool *isNew = nullptr) {
+  if (auto it = map.find(v); it != map.end()) {
+    if (isNew)
+      *isNew = false;
+    return it->second;
+  }
 
+  std::string name =
+      makeUniquePortName(desiredName, fallbackPrefix, usedNames);
   size_t idx = inputs.size();
-  auto ty = v.getType();
-  std::string name = (baseName + Twine(idx)).str();
-  inputs.emplace_back(StringAttr::get(ctx, name), ty);
+  inputs.emplace_back(StringAttr::get(ctx, name), v.getType());
   map.try_emplace(v, idx);
-
+  if (isNew)
+    *isNew = true;
   return idx;
 }
 
-// Collect a unique output for a given value if not yet present.
-// Returns true if the value was added to the collection.
-static void
-collectUniqueOutput(DenseSet<Value> &added,
-                    SmallVector<std::pair<StringAttr, Value>> &outputs, Value v,
-                    StringRef baseName, MLIRContext *ctx) {
+static void collectUniqueOutput(DenseSet<Value> &added,
+                                SmallVector<std::pair<StringAttr, Value>> &outputs,
+                                Value v, llvm::StringSet<> &usedNames,
+                                MLIRContext *ctx, StringRef desiredName,
+                                StringRef fallbackPrefix) {
   if (added.contains(v))
-    return; // Already added
-
-  std::string name = (baseName + Twine(added.size())).str();
+    return;
+  std::string name =
+      makeUniquePortName(desiredName, fallbackPrefix, usedNames);
   outputs.emplace_back(StringAttr::get(ctx, name), v);
   added.insert(v);
 }
@@ -105,6 +259,8 @@ static LogicalResult transformSequentialModule(HWModuleOp seqModule) {
   SmallVector<std::pair<StringAttr, Type>> sInputs;
   SmallVector<std::pair<StringAttr, Value>> sOutputs;
   SmallVector<std::pair<OpOperand *, size_t>> operandsToReplace;
+  llvm::StringSet<> usedInputNames;
+  llvm::StringSet<> usedOutputNames;
 
   for (Operation &op : *seqModule.getBodyBlock()) {
     if (!isSeqBoundaryOp(&op))
@@ -114,15 +270,18 @@ static LogicalResult transformSequentialModule(HWModuleOp seqModule) {
       Value v = operand.get();
       if (isConst(v) || v.getDefiningOp<seq::FirMemOp>())
         continue;
-
-      size_t idx = collectUniqueInput(valToInputIdx, sInputs, v, "s_in_",
-                                      seqModule.getContext());
+      std::string desiredName = getSeqOperandPortName(&op, operand);
+      size_t idx =
+          collectUniqueInput(valToInputIdx, sInputs, v, usedInputNames,
+                             seqModule.getContext(), desiredName, "seq_in");
       operandsToReplace.push_back({&operand, idx});
     }
 
+    unsigned resultIndex = 0;
     for (Value res : op.getResults())
-      collectUniqueOutput(exported, sOutputs, res, "s_out_",
-                          seqModule.getContext());
+      collectUniqueOutput(exported, sOutputs, res, usedOutputNames,
+                          seqModule.getContext(),
+                          getSeqResultPortName(&op, resultIndex++), "seq_out");
   }
 
   if (!sInputs.empty()) {
@@ -166,12 +325,17 @@ static LogicalResult transformCombinationalModule(HWModuleOp combModule,
       memOps.push_back(op);
   });
 
+  llvm::StringSet<> usedOutputNames;
+  llvm::StringSet<> usedInputNames;
   SmallVector<std::pair<StringAttr, Value>> cOutputs;
   for (Operation *op : seqOps)
-    for (Value v : op->getOperands()) {
+    for (OpOperand &operand : op->getOpOperands()) {
+      Value v = operand.get();
       if (isConst(v) || v.getDefiningOp<seq::FirMemOp>())
         continue;
-      collectUniqueOutput(cOutAdded, cOutputs, v, "to_s_", combModule.getContext());
+      collectUniqueOutput(cOutAdded, cOutputs, v, usedOutputNames,
+                          combModule.getContext(),
+                          getSeqOperandPortName(op, operand), "to_s");
     }
 
   if (!cOutputs.empty())
@@ -180,14 +344,18 @@ static LogicalResult transformCombinationalModule(HWModuleOp combModule,
   SmallVector<std::pair<StringAttr, Type>> cInputs;
   DenseMap<Value, size_t> cValueToInputIdx;
   SmallVector<Value> valuesToReplace;
-  for (Operation *op : seqOps)
+  for (Operation *op : seqOps) {
+    unsigned resultIndex = 0;
     for (Value res : op->getResults()) {
-      size_t oldSize = cInputs.size();
-      collectUniqueInput(cValueToInputIdx, cInputs, res, "from_s_",
-                         combModule.getContext());
-      if (cInputs.size() > oldSize)
+      bool inserted = false;
+      collectUniqueInput(cValueToInputIdx, cInputs, res, usedInputNames,
+                         combModule.getContext(),
+                         getSeqResultPortName(op, resultIndex++), "from_s",
+                         &inserted);
+      if (inserted)
         valuesToReplace.push_back(res);
     }
+  }
 
   if (!cInputs.empty()) {
     combModule.appendInputs(cInputs);
