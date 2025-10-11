@@ -48,9 +48,14 @@ static bool needsWireInsertion(Value value) {
 
 struct HWInsertWiresPass
     : circt::hw::impl::HWInsertWiresBase<HWInsertWiresPass> {
+  using HWInsertWiresBase::HWInsertWiresBase;
+
   void runOnOperation() override {
     auto module = getOperation();
     OpBuilder builder(&getContext());
+
+    if (!moduleName.empty() && module.getModuleName() != moduleName)
+      return;
 
     // Map from value to the wire that replaces it to avoid duplicate wires
     DenseMap<Value, Value> valueToWire;

@@ -707,6 +707,10 @@ LogicalResult processBuffer(
     pm.addPass(hw::createHWCombmemToReg());
     pm.addPass(
         hw::createHWReduceMemReadLatency(hw::HWReduceMemReadLatencyOptions{1}));
+    auto &hwModulePM = pm.nest<hw::HWModuleOp>();
+    hw::HWInsertWiresOptions insertWiresOptions;
+    insertWiresOptions.moduleName = "corvus_top";
+    hwModulePM.addPass(hw::createHWInsertWires(insertWiresOptions));
   }
   // Corvus Compiler Pass End
 

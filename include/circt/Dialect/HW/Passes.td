@@ -148,10 +148,14 @@ def HWInsertWires : Pass<"hw-insert-wires", "hw::HWModuleOp"> {
     This pass inserts hw.wire operations between direct connections involving:
     - hw.module IOs and seq register/memory operations
     - Direct connections between seq register/memory operations
-    
+
     The target operations are seq::FirRegOp, seq::FirMemReadOp, 
     seq::FirMemWriteOp, and seq::FirMemReadWriteOp.
   }];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "",
+           "Only run on hw.module operations whose name matches this string">
+  ];
 }
 
 def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
