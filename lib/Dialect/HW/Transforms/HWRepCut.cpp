@@ -136,8 +136,8 @@ public:
     }
 
     validNodes.insert(id);
-    llvm::dbgs() << "Op: " << id << " : " << op->getName().getStringRef()
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "Op: " << id << " : "
+                            << op->getName().getStringRef() << "\n");
     return id;
   }
 
@@ -148,7 +148,7 @@ public:
     NodeID fromId = opToID[from];
     NodeID toId = opToID[to];
 
-    llvm::dbgs() << "Edge: " << fromId << " -> " << toId << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "Edge: " << fromId << " -> " << toId << "\n");
 
     outNeigh[fromId].push_back(toId);
     inNeigh[toId].push_back(fromId);
@@ -639,24 +639,24 @@ struct HWRepCutPass : public circt::hw::impl::HWRepCutBase<HWRepCutPass> {
     // Run RepCut steps
     pg.identifySinkNodes();
     for (NodeID id : pg.sinkNodes)
-      llvm::dbgs() << id << "\n";
+      LLVM_DEBUG(llvm::dbgs() << id << "\n");
     pg.initTrees();
     for (const auto &tree : pg.trees) {
-      llvm::dbgs() << "Tree: ";
+      LLVM_DEBUG(llvm::dbgs() << "Tree: ");
       for (auto node : tree)
-        llvm::dbgs() << node << " ";
-      llvm::dbgs() << "\n";
+        LLVM_DEBUG(llvm::dbgs() << node << " ");
+      LLVM_DEBUG(llvm::dbgs() << "\n");
     }
     pg.initPieces();
     for (const auto &piece : pg.pieces) {
-      llvm::dbgs() << "Piece: ";
+      LLVM_DEBUG(llvm::dbgs() << "Piece: ");
       for (auto node : piece)
-        llvm::dbgs() << node << " ";
-      llvm::dbgs() << "\n";
+        LLVM_DEBUG(llvm::dbgs() << node << " ");
+      LLVM_DEBUG(llvm::dbgs() << "\n");
     }
     pg.updateHyperGraph();
-    llvm::dbgs() << "Hypergraph: " << pg.hg.nodes.size() << " nodes, "
-                 << pg.hg.edges.size() << " edges\n";
+    LLVM_DEBUG(llvm::dbgs() << "Hypergraph: " << pg.hg.nodes.size() << " nodes, "
+                 << pg.hg.edges.size() << " edges\n");
 
     // Write hypergraph to file and call KaHyPar
     std::string tempDir = "/tmp";
