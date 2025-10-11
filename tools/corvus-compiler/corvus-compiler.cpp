@@ -717,10 +717,10 @@ LogicalResult processBuffer(
         hw::createHWReduceMemReadLatency(hw::HWReduceMemReadLatencyOptions{1}));
     auto &hwModulePM = pm.nest<hw::HWModuleOp>();
     hw::HWInsertWiresOptions insertWiresOptions;
-    insertWiresOptions.moduleName = "corvus_top";
+    insertWiresOptions.moduleName = "__corvus_top";
     hwModulePM.addPass(hw::createHWInsertWires(insertWiresOptions));
     hw::HWRepCutOptions repcutOptions;
-    repcutOptions.moduleName = "corvus_top";
+    repcutOptions.moduleName = "__corvus_top";
     repcutOptions.numPartitions =
         corvusCompilerOptions.getRepCutNumPartitions();
     hwModulePM.addPass(hw::createHWRepCut(repcutOptions));

@@ -110,8 +110,9 @@ def HWPrintStateElemDist: Pass<"hw-print-state-elem-dist", "mlir::ModuleOp"> {
 def HWStripExternalModule: Pass<"hw-strip-external-module", "mlir::ModuleOp"> {
   let summary = "Strip external module references";
   let description = [{
-    This pass strips external module references and replaces them with
-    their internal counterparts.
+    This pass splits the single public `hw.module` into private implementation
+    modules `__corvus_top` and `__corvus_external`, plus a public wrapper that
+    keeps the original module name while instantiating the two private modules.
   }];
 }
 
