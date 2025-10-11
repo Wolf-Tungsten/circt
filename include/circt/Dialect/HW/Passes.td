@@ -168,6 +168,10 @@ def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
     In C: add outputs for values that feed seq op operands (non-const), add inputs for
     seq op results and replace uses, then erase seq ops. The original module is erased.
   }];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "\"__corvus_top\"",
+      "Only split the hw.module whose name matches this string (default: __corvus_top)">
+  ];
 }
 
 def HWFixXMRRef : Pass<"hw-fix-xmr-ref", "mlir::ModuleOp"> {

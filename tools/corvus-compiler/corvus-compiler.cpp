@@ -724,6 +724,7 @@ LogicalResult processBuffer(
     repcutOptions.numPartitions =
         corvusCompilerOptions.getRepCutNumPartitions();
     hwModulePM.addPass(hw::createHWRepCut(repcutOptions));
+    pm.addPass(hw::createHWSplitSeqComb());
   }
   // Corvus Compiler Pass End
 
