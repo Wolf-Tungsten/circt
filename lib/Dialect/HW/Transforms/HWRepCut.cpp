@@ -625,6 +625,9 @@ struct HWRepCutPass : public circt::hw::impl::HWRepCutBase<HWRepCutPass> {
   void runOnOperation() override {
     auto moduleOp = getOperation();
 
+    if (!moduleName.empty() && moduleOp.getModuleName() != moduleName)
+      return;
+
     // Build statement graph from the module
     StatementGraph sg;
     sg.buildStatementGraph(moduleOp);

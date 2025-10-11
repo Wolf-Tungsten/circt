@@ -222,7 +222,9 @@ def HWRepCut : Pass<"hw-repcut", "hw::HWModuleOp"> {
   }];
   let options = [
     Option<"numPartitions", "num-partitions", "unsigned", "2",
-      "Number of partitions to create (default: 2)">
+      "Number of partitions to create (default: 2)">,
+    Option<"moduleName", "module-name", "std::string", "",
+      "Only run on hw.module operations whose name matches this string">
   ];
   let dependentDialects = ["seq::SeqDialect", "comb::CombDialect"];
 }
