@@ -18,6 +18,8 @@ add_circt_dialect_library(CIRCTHWTransforms
   HWFixXMRRef.cpp
   HWGlobalUniqueInnerSym.cpp
   HWCombmemToReg.cpp
+  HWRepCut.cpp
+  HWPartitionModules.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen
