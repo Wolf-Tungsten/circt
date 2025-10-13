@@ -19,7 +19,9 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdint>
+#include <utility>
 
 #define DEBUG_TYPE "hw-partition-modules"
 
@@ -74,8 +76,72 @@ static bool belongsToPartition(Operation *op, uint64_t partitionId) {
   return ids.contains(partitionId);
 }
 
+struct PartitionCloneInfo {
+  Operation *module;
+  SmallVector<unsigned> inputPortMap;
+  SmallVector<unsigned> outputPortMap;
+  uint64_t partitionId;
+};
+
+static LogicalResult
+rebuildModuleWithPartitionInstances(HWModuleOp original,
+                                    ArrayRef<PartitionCloneInfo> partitions) {
+  if (partitions.empty())
+    return success();
+
+  Block *body = original.getBodyBlock();
+  auto *terminator = body->getTerminator();
+
+  for (Operation &op : llvm::make_early_inc_range(body->without_terminator())) {
+    op.dropAllUses();
+    op.erase();
+  }
+
+  OpBuilder builder(original.getContext());
+  builder.setInsertionPointToStart(body);
+
+  SmallVector<Value> moduleOutputs(original.getNumOutputPorts());
+  auto loc = original.getLoc();
+  auto moduleSymName = SymbolTable::getSymbolName(original);
+
+  for (const auto &info : partitions) {
+    SmallVector<Value> inputs;
+    inputs.reserve(info.inputPortMap.size());
+    for (unsigned inputIdx : info.inputPortMap)
+      inputs.push_back(body->getArgument(inputIdx));
+
+    std::string instNameStr =
+        (moduleSymName.str() + "_P" + Twine(info.partitionId) + "_inst").str();
+    auto instName = builder.getStringAttr(instNameStr);
+
+    auto instance =
+        builder.create<hw::InstanceOp>(loc, info.module, instName, inputs);
+
+    for (auto [resultIdx, originalIdx] : llvm::enumerate(info.outputPortMap)) {
+      if (moduleOutputs[originalIdx])
+        continue;
+      moduleOutputs[originalIdx] = instance.getResult(resultIdx);
+    }
+  }
+
+  for (auto [idx, value] : llvm::enumerate(moduleOutputs)) {
+    if (!value) {
+      original->emitError("failed to map output port ")
+          << idx << " to a partition";
+      return failure();
+    }
+  }
+
+  builder.setInsertionPoint(terminator);
+  builder.create<hw::OutputOp>(loc, moduleOutputs);
+  terminator->erase();
+  return success();
+}
+
 struct HWPartitionModulesPass
     : circt::hw::impl::HWPartitionModulesBase<HWPartitionModulesPass> {
+  using HWPartitionModulesBase::HWPartitionModulesBase;
+
   void runOnOperation() override {
     auto top = getOperation(); // mlir::ModuleOp
 
@@ -87,21 +153,38 @@ struct HWPartitionModulesPass
       return;
 
     OpBuilder builder(top.getContext());
-    SmallVector<HWModuleOp> modulesToErase;
+    bool processedTarget = false;
 
     // Process each module
     for (HWModuleOp module : hwMods) {
+      auto moduleSymName = SymbolTable::getSymbolName(module);
+      if (moduleName.empty() ||
+          moduleSymName.getValue() != moduleName.getValue())
+        continue;
+
       // Collect all partition IDs used in this module
-      DenseSet<uint64_t> partitionIds = collectAllPartitionIds(module);
+      DenseSet<uint64_t> partitionIdSet = collectAllPartitionIds(module);
+      SmallVector<uint64_t> partitionIds;
+      partitionIds.reserve(partitionIdSet.size());
+      for (uint64_t id : partitionIdSet)
+        partitionIds.push_back(id);
+      llvm::sort(partitionIds);
+
+      llvm::errs() << "Module: " << moduleSymName.getValue()
+                   << " partition count: " << partitionIds.size() << "\n";
 
       if (partitionIds.empty())
         continue; // No partitions found, keep the module as is
+
+      SmallVector<PartitionCloneInfo> partitionInfos;
+      partitionInfos.reserve(partitionIds.size());
 
       // For each partition ID, create a new module
       for (uint64_t partitionId : partitionIds) {
         // Clone the module
         builder.setInsertionPointAfter(module);
         auto clonedModule = cast<HWModuleOp>(builder.clone(*module));
+        clonedModule.setVisibility(SymbolTable::Visibility::Private);
 
         // Rename the cloned module
         auto originalName = SymbolTable::getSymbolName(module);
@@ -172,6 +255,14 @@ struct HWPartitionModulesPass
             unusedOutputs.push_back(i);
         }
 
+        SmallVector<unsigned> inputsToKeep;
+        inputsToKeep.reserve(clonedModule.getNumInputPorts() -
+                             unusedInputs.size());
+        for (unsigned i = 0; i < clonedModule.getNumInputPorts(); ++i) {
+          if (!llvm::is_contained(unusedInputs, i))
+            inputsToKeep.push_back(i);
+        }
+
         // Step 6: Remove unused ports
         llvm::sort(unusedInputs);
         llvm::sort(unusedOutputs);
@@ -179,15 +270,22 @@ struct HWPartitionModulesPass
         // Remove corresponding block arguments for inputs
         for (auto it = unusedInputs.rbegin(); it != unusedInputs.rend(); it++)
           body->eraseArgument(*it);
+
+        partitionInfos.push_back({clonedModule.getOperation(),
+                                  std::move(inputsToKeep),
+                                  std::move(outputsToKeep), partitionId});
       }
 
-      // Mark original module for erasure
-      modulesToErase.push_back(module);
+      if (failed(rebuildModuleWithPartitionInstances(module, partitionInfos))) {
+        signalPassFailure();
+        return;
+      }
+
+      processedTarget = true;
+      break;
     }
 
-    // Erase original modules after processing all
-    for (HWModuleOp module : modulesToErase)
-      module->erase();
+    (void)processedTarget;
   }
 };
 

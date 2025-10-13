@@ -725,6 +725,12 @@ LogicalResult processBuffer(
         corvusCompilerOptions.getRepCutNumPartitions();
     hwModulePM.addPass(hw::createHWRepCut(repcutOptions));
     pm.addPass(hw::createHWSplitSeqComb());
+    hw::HWPartitionModulesOptions seqPartitionOptions;
+    seqPartitionOptions.moduleName = "__corvus_seq";
+    pm.addPass(hw::createHWPartitionModules(seqPartitionOptions));
+    hw::HWPartitionModulesOptions combPartitionOptions;
+    combPartitionOptions.moduleName = "__corvus_comb";
+    pm.addPass(hw::createHWPartitionModules(combPartitionOptions));
   }
   // Corvus Compiler Pass End
 
