@@ -31,13 +31,12 @@ that instantiates all partition clones.
 
 ### Pass Entry
 
-1. The pass walks every `hw.module` inside the top-level `mlir::ModuleOp`. If
-   `--module-name` is omitted the pass becomes a no-op; otherwise, only the
-   matching symbol is processed.
-2. For each module, gather the distinct partition IDs by visiting all
-   operations and inspecting their `repcut_partitions` attribute. A debug
-   message is emitted via `llvm::errs()` with the number of discovered
-   partitions.
+1. The pass looks up the `hw.module` named by `--module-name` in the
+   top-level symbol table. If no module with that name exists, the pass emits
+   an error and fails.
+2. Gather the distinct partition IDs by visiting operations in that module and
+   inspecting their `repcut_partitions` attributes. A debug message is emitted
+   via `llvm::errs()` with the number of discovered partitions.
 3. Modules without any partition IDs are skipped entirely.
 
 ### Building the Partitioned Clones
