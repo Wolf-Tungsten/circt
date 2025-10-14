@@ -669,8 +669,8 @@ struct HWRepCutPass : public circt::hw::impl::HWRepCutBase<HWRepCutPass> {
       LLVM_DEBUG(llvm::dbgs() << "\n");
     }
     pg.updateHyperGraph();
-    LLVM_DEBUG(llvm::dbgs() << "Hypergraph: " << pg.hg.nodes.size() << " nodes, "
-                 << pg.hg.edges.size() << " edges\n");
+    LLVM_DEBUG(llvm::dbgs() << "Hypergraph: " << pg.hg.nodes.size()
+                            << " nodes, " << pg.hg.edges.size() << " edges\n");
 
     // Write hypergraph to file and call KaHyPar
     std::string tempDir = "/tmp";
@@ -902,7 +902,7 @@ private:
         }
 
         ArrayAttr partitionArrayAttr = ArrayAttr::get(context, partitionAttrs);
-        op->setAttr("repcut_partitions", partitionArrayAttr);
+        op->setAttr("hw.repcut_partitions", partitionArrayAttr);
       }
     }
   }

@@ -5,9 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 //
-// This pass partitions S and C modules based on repcut_partitions attributes.
-// For each unique partition ID, it creates a separate module containing only
-// operations assigned to that partition.
+// This pass partitions S and C modules based on hw.repcut_partitions
+// attributes. For each unique partition ID, it creates a separate module
+// containing only operations assigned to that partition.
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,7 +42,7 @@ namespace {
 static DenseSet<uint64_t> getPartitionIds(Operation *op) {
   DenseSet<uint64_t> ids;
 
-  auto attr = op->getAttrOfType<ArrayAttr>("repcut_partitions");
+  auto attr = op->getAttrOfType<ArrayAttr>("hw.repcut_partitions");
   if (!attr)
     return ids;
 

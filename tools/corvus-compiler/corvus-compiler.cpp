@@ -121,10 +121,10 @@ cl::opt<bool>
                  cl::desc("Run the verifier after each transformation pass"),
                  cl::init(true), cl::cat(mainCategory));
 
-cl::opt<bool> disableCorvusPass(
-    "disable-corvus-pass",
-    cl::desc("Skip the Corvus Compiler pass pipeline"),
-    cl::init(false), cl::cat(mainCategory));
+cl::opt<bool>
+    disableCorvusPass("disable-corvus-pass",
+                      cl::desc("Skip the Corvus Compiler pass pipeline"),
+                      cl::init(false), cl::cat(mainCategory));
 
 cl::opt<std::string>
     hwOutFile("output-hw-mlir",

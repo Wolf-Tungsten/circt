@@ -3,8 +3,8 @@
 module {
   hw.module @target(%a: i1, %b: i1) -> (i1, i1)
       attributes {sym_visibility = "public"} {
-    %and = comb.and %a, %b : i1 {repcut_partitions = [0]}
-    %or = comb.or %a, %b : i1 {repcut_partitions = [1]}
+    %and = comb.and %a, %b : i1 {hw.repcut_partitions = [0]}
+    %or = comb.or %a, %b : i1 {hw.repcut_partitions = [1]}
     hw.output %and, %or : i1, i1
   }
 }

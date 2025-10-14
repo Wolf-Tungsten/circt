@@ -3,14 +3,14 @@
 This document captures the behaviour implemented in
 `lib/Dialect/HW/Transforms/HWPartitionModules.cpp`. The pass duplicates the
 `hw.module` referenced by `--module-name`, producing one clone per
-`repcut_partitions` identifier and rewriting the original module into a wrapper
-that instantiates all partition clones.
+`hw.repcut_partitions` identifier and rewriting the original module into a
+wrapper that instantiates all partition clones.
 
 ## High-Level Goals
 
 - Require a `--module-name` option to pick the single `hw.module` that will be
   partitioned; other modules are left untouched.
-- Discover every partition identifier recorded in `repcut_partitions`
+- Discover every partition identifier recorded in `hw.repcut_partitions`
   attributes within the selected module.
 - Produce one clone per partition, remove operations that do not belong to that
   partition, and shrink the port list to the signals that remain in use.
@@ -21,11 +21,12 @@ that instantiates all partition clones.
 ## Preconditions
 
 - Operations that should survive in a particular partition must carry a
-  `repcut_partitions` array attribute whose entries are integer IDs. Multiple
+  `hw.repcut_partitions` array attribute whose entries are integer IDs. Multiple
   IDs indicate that the operation should appear in every listed partition.
 - `hw.output` is treated as belonging to every partition so terminators are
   always preserved.
-- Modules with no operations tagged by `repcut_partitions` are left untouched.
+- Modules with no operations tagged by `hw.repcut_partitions` are left
+  untouched.
 
 ## Processing Flow
 
@@ -35,8 +36,8 @@ that instantiates all partition clones.
    top-level symbol table. If no module with that name exists, the pass emits
    an error and fails.
 2. Gather the distinct partition IDs by visiting operations in that module and
-   inspecting their `repcut_partitions` attributes. A debug message is emitted
-   via `llvm::errs()` with the number of discovered partitions.
+   inspecting their `hw.repcut_partitions` attributes. A debug message is
+   emitted via `llvm::errs()` with the number of discovered partitions.
 3. Modules without any partition IDs are skipped entirely.
 
 ### Building the Partitioned Clones
@@ -49,7 +50,7 @@ that instantiates all partition clones.
    that belong to the current partition (or by block arguments); only those
    results are preserved in the clone.
 4. Walk the clone's body. Any operation (except the module, `hw.output`, and
-   block arguments) whose `repcut_partitions` does not contain the current ID
+   block arguments) whose `hw.repcut_partitions` does not contain the current ID
    is queued for removal. The helper treats missing attributes as "does not
    belong".
 5. Erase the queued operations, rewriting uses to drop them safely.

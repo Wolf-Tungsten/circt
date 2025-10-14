@@ -220,7 +220,8 @@ def HWRepCut : Pass<"hw-repcut", "hw::HWModuleOp"> {
     4. Builds an intersection hypergraph with sink pieces as vertices and 
        non-sink pieces as hyperedges
     5. Uses KaHyPar to partition the hypergraph
-    6. Assigns partition IDs to each operation as "repcut_partitions" attribute
+    6. Assigns partition IDs to each operation as "hw.repcut_partitions"
+       attribute
     
     Operations may belong to multiple partitions due to replication.
     Requires KaHyPar external tool to be available in PATH.
@@ -235,10 +236,10 @@ def HWRepCut : Pass<"hw-repcut", "hw::HWModuleOp"> {
 }
 
 def HWPartitionModules : Pass<"hw-partition-modules", "mlir::ModuleOp"> {
-  let summary = "Partition a module into clones based on repcut_partitions attribute";
+  let summary = "Partition a module into clones based on hw.repcut_partitions attribute";
   let description = [{
     This pass clones the `hw.module` identified by `--module-name` for every
-    partition ID recorded in `repcut_partitions` attributes. Each clone keeps
+    partition ID recorded in `hw.repcut_partitions` attributes. Each clone keeps
     only the operations assigned to its partition and erases unused ports. The
     original module is rewritten into a wrapper that instantiates all clones and
     reconnects their interfaces purely through SSA values. Modules without
