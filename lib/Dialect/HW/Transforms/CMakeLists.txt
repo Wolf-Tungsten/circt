@@ -20,6 +20,7 @@ add_circt_dialect_library(CIRCTHWTransforms
   HWCombmemToReg.cpp
   HWRepCut.cpp
   HWPartitionModules.cpp
+  HWExportVerilatorHierVlt.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen

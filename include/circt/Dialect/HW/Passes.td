@@ -252,4 +252,24 @@ def HWPartitionModules : Pass<"hw-partition-modules", "mlir::ModuleOp"> {
   ];
 }
 
+def HWExportVerilatorHierVlt
+    : Pass<"hw-export-verilator-hier-vlt", "mlir::ModuleOp"> {
+  let summary = "Emit Verilator hierarchical control file directives";
+  let description = [{
+    This pass scans all `hw.module` operations and emits ``hier_block`` and
+    ``hier_workers`` directives for those annotated with the
+    `hw.corvus_partition` attribute. The directives are written to a Verilator
+    control file starting with the `` `verilator_config`` header.
+  }];
+  let options = [
+    Option<"verilatorHierVltOutput", "verilator-hier-vlt-output", "std::string",
+           "",
+           "Path to the generated Verilator control (.vlt) file; when empty no "
+           "file is produced">,
+    Option<"verilatorHierVltWorkers", "verilator-hier-vlt-workers", "unsigned",
+           "1",
+           "Number of workers emitted for each ``hier_workers`` directive">
+  ];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD

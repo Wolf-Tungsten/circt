@@ -186,6 +186,10 @@ struct HWPartitionModulesPass
           top.getContext(),
           (originalName.str() + "_P" + Twine(partitionId)).str());
       clonedModule.setSymName(newName);
+      // 在 clonedModule 上添加一个 hw.corvus_partition 属性，用于后续生成
+      // verilator vlt
+      clonedModule->setAttr("hw.corvus_partition",
+                            builder.getI64IntegerAttr(partitionId));
 
       Block *body = clonedModule.getBodyBlock();
       auto outputOp = cast<hw::OutputOp>(body->getTerminator());

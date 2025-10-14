@@ -255,6 +255,14 @@ struct CorvusCompilerCmdOptions {
       "repcut-num-partitions",
       llvm::cl::desc("Number of partitions for the HW RepCut pass"),
       llvm::cl::init(8)};
+  llvm::cl::opt<std::string> verilatorHierVltOutput{
+      "verilator-hier-vlt-output",
+      llvm::cl::desc("Path to emit Verilator hierarchy control (.vlt) file"),
+      llvm::cl::init("")};
+  llvm::cl::opt<unsigned> verilatorHierVltWorkers{
+      "verilator-hier-vlt-workers",
+      llvm::cl::desc("Workers value used for each hier_workers directive"),
+      llvm::cl::init(1)};
 };
 
 llvm::ManagedStatic<CorvusCompilerCmdOptions> clOptions;
@@ -278,7 +286,8 @@ public:
         addVivadoRAMAddressConflictSynthesisBugWorkaround(false),
         disableOptimization(false), stripFirDebugInfo(true),
         stripDebugInfo(false), exportModuleHierarchy(false),
-        repcutNumPartitions(8) {
+        repcutNumPartitions(8), verilatorHierVltOutput(""),
+        verilatorHierVltWorkers(1) {
     if (!clOptions.isConstructed())
       return;
     outputFilename = clOptions->outputFilename;
@@ -299,6 +308,8 @@ public:
     stripDebugInfo = clOptions->stripDebugInfo;
     exportModuleHierarchy = clOptions->exportModuleHierarchy;
     repcutNumPartitions = clOptions->repcutNumPartitions;
+    verilatorHierVltOutput = clOptions->verilatorHierVltOutput;
+    verilatorHierVltWorkers = clOptions->verilatorHierVltWorkers;
   }
   StringRef getOutputFilename() const { return outputFilename; }
   bool isDefaultOutputFilename() const { return outputFilename == "-"; }
@@ -335,6 +346,10 @@ public:
   bool shouldStripDebugInfo() const { return stripDebugInfo; }
   bool shouldExportModuleHierarchy() const { return exportModuleHierarchy; }
   unsigned getRepCutNumPartitions() const { return repcutNumPartitions; }
+  StringRef getVerilatorHierVltOutput() const { return verilatorHierVltOutput; }
+  unsigned getVerilatorHierVltWorkers() const {
+    return verilatorHierVltWorkers;
+  }
 
 private:
   std::string outputFilename;
@@ -354,6 +369,8 @@ private:
   bool stripDebugInfo;
   bool exportModuleHierarchy;
   unsigned repcutNumPartitions;
+  std::string verilatorHierVltOutput;
+  unsigned verilatorHierVltWorkers;
 };
 
 namespace detail {
@@ -731,6 +748,12 @@ LogicalResult processBuffer(
     hw::HWPartitionModulesOptions combPartitionOptions;
     combPartitionOptions.moduleName = "__corvus_comb";
     pm.addPass(hw::createHWPartitionModules(combPartitionOptions));
+    hw::HWExportVerilatorHierVltOptions hierVltOptions;
+    hierVltOptions.verilatorHierVltOutput =
+        corvusCompilerOptions.getVerilatorHierVltOutput().str();
+    hierVltOptions.verilatorHierVltWorkers =
+        corvusCompilerOptions.getVerilatorHierVltWorkers();
+    pm.addPass(hw::createHWExportVerilatorHierVlt(hierVltOptions));
   }
   // Corvus Compiler Pass End
 
