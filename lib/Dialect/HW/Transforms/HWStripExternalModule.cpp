@@ -138,6 +138,7 @@ void HWStripExternalModule::runOnOperation() {
 
   corvusExternal.setPrivate();
   corvusExternal->setAttr("__corvus_external", moduleBuilder.getUnitAttr());
+  corvusExternal->setAttr("__corvus_partition", moduleBuilder.getUnitAttr());
 
   corvusWrapper.setPublic();
 

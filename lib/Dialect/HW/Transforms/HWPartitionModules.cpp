@@ -187,6 +187,8 @@ struct HWPartitionModulesPass
           (originalName.str() + "_P" + Twine(partitionId)).str());
       clonedModule.setSymName(newName);
 
+      clonedModule->setAttr("__corvus_partition", builder.getUnitAttr());
+
       Block *body = clonedModule.getBodyBlock();
       auto outputOp = cast<hw::OutputOp>(body->getTerminator());
 
