@@ -201,6 +201,16 @@ def HWGlobalUniqueInnerSym : Pass<"hw-global-unique-inner-sym", "mlir::ModuleOp"
   }];
 }
 
+def HWEmitCorvusConnectivity :
+    Pass<"hw-emit-corvus-connectivity", "mlir::ModuleOp"> {
+  let summary = "Emit JSON describing Corvus connectivity";
+  let options = [
+    Option<"jsonFile", "hw-emit-corvus-connectivity-json", "std::string", "",
+           "Write the Corvus connectivity JSON to the given path (empty to "
+           "skip emission)">
+  ];
+}
+
 def HWCombmemToReg : Pass<"hw-combmem-to-reg", "mlir::ModuleOp"> {
   let summary = "Convert combmem to register";
   let description = [{

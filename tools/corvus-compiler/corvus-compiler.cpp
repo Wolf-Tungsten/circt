@@ -251,6 +251,12 @@ struct CorvusCompilerCmdOptions {
       "export-module-hierarchy",
       llvm::cl::desc("Export module and instance hierarchy as JSON"),
       llvm::cl::init(false)};
+  llvm::cl::opt<std::string> corvusConnectivityJson{
+      "hw-emit-corvus-connectivity-json",
+      llvm::cl::desc("Write the Corvus connectivity JSON to the given path "
+                     "(empty to skip)"),
+      llvm::cl::init(""), llvm::cl::value_desc("path"),
+      llvm::cl::cat(mainCategory)};
   llvm::cl::opt<unsigned> repcutNumPartitions{
       "repcut-num-partitions",
       llvm::cl::desc("Number of partitions for the HW RepCut pass"),
@@ -278,7 +284,7 @@ public:
         addVivadoRAMAddressConflictSynthesisBugWorkaround(false),
         disableOptimization(false), stripFirDebugInfo(true),
         stripDebugInfo(false), exportModuleHierarchy(false),
-        repcutNumPartitions(8) {
+        corvusConnectivityJson(""), repcutNumPartitions(8) {
     if (!clOptions.isConstructed())
       return;
     outputFilename = clOptions->outputFilename;
@@ -298,6 +304,7 @@ public:
     stripFirDebugInfo = clOptions->stripFirDebugInfo;
     stripDebugInfo = clOptions->stripDebugInfo;
     exportModuleHierarchy = clOptions->exportModuleHierarchy;
+    corvusConnectivityJson = clOptions->corvusConnectivityJson;
     repcutNumPartitions = clOptions->repcutNumPartitions;
   }
   StringRef getOutputFilename() const { return outputFilename; }
@@ -334,6 +341,7 @@ public:
   bool shouldStripFirDebugInfo() const { return stripFirDebugInfo; }
   bool shouldStripDebugInfo() const { return stripDebugInfo; }
   bool shouldExportModuleHierarchy() const { return exportModuleHierarchy; }
+  StringRef getCorvusConnectivityJson() const { return corvusConnectivityJson; }
   unsigned getRepCutNumPartitions() const { return repcutNumPartitions; }
 
 private:
@@ -353,6 +361,7 @@ private:
   bool stripFirDebugInfo;
   bool stripDebugInfo;
   bool exportModuleHierarchy;
+  std::string corvusConnectivityJson;
   unsigned repcutNumPartitions;
 };
 
@@ -731,6 +740,10 @@ LogicalResult processBuffer(
     hw::HWPartitionModulesOptions combPartitionOptions;
     combPartitionOptions.moduleName = "__corvus_comb";
     pm.addPass(hw::createHWPartitionModules(combPartitionOptions));
+    hw::HWEmitCorvusConnectivityOptions connectivityOptions;
+    connectivityOptions.jsonFile =
+        std::string(corvusCompilerOptions.getCorvusConnectivityJson());
+    pm.addPass(hw::createHWEmitCorvusConnectivity(connectivityOptions));
   }
   // Corvus Compiler Pass End
 
