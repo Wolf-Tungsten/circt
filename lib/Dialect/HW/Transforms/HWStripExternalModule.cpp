@@ -22,9 +22,9 @@
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/SV/SVOps.h"
+#include "circt/Support/BackedgeBuilder.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
-#include "circt/Support/BackedgeBuilder.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
@@ -115,7 +115,8 @@ void HWStripExternalModule::runOnOperation() {
   OpBuilder moduleBuilder(mlirModuleOp.getBodyRegion());
   auto originalNameAttr = userTop.getModuleNameAttr();
   auto corvusTopNameAttr = moduleBuilder.getStringAttr("__corvus_top");
-  auto corvusExternalNameAttr = moduleBuilder.getStringAttr("__corvus_external");
+  auto corvusExternalNameAttr =
+      moduleBuilder.getStringAttr("__corvus_external");
 
   userTop.setSymNameAttr(corvusTopNameAttr);
   userTop.setPrivate();
@@ -174,26 +175,44 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
   for (auto instance : corvusTop.getOps<hw::InstanceOp>())
     instances.push_back(instance);
 
+  // Collect all outputs to append
+  SmallVector<std::pair<StringAttr, Value>> outputsToAppend;
+  // Collect all inputs to append
+  SmallVector<std::pair<StringAttr, Type>> inputsToAppend;
+  // Store mapping from result to input index for later replacement
+  SmallVector<std::pair<Value, unsigned>> resultToInputIndex;
+
   for (auto instance : instances) {
     auto instanceName = instance.getInstanceName().str();
 
     for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
       std::string base = ("extp_" + instanceName + "_in_" + Twine(idx)).str();
       std::string uniqueName = makeUniqueName(base, usedOutputNames);
-      corvusTop.appendOutput(uniqueName, operand);
+      auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
+      outputsToAppend.push_back({nameAttr, operand});
       bridgeOperandPorts.push_back({uniqueName, operand.getType()});
     }
 
     for (auto [idx, result] : llvm::enumerate(instance.getResults())) {
       std::string base = ("extp_" + instanceName + "_out_" + Twine(idx)).str();
       std::string uniqueName = makeUniqueName(base, usedInputNames);
-      auto [nameAttr, blockArg] =
-          corvusTop.appendInput(uniqueName, result.getType());
-      (void)nameAttr;
-      result.replaceAllUsesWith(blockArg);
-      bridgeResultPorts.push_back({uniqueName, blockArg.getType()});
+      auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
+      inputsToAppend.push_back({nameAttr, result.getType()});
+      resultToInputIndex.push_back({result, bridgeResultPorts.size()});
+      bridgeResultPorts.push_back({uniqueName, result.getType()});
     }
   }
+
+  // Batch append all outputs
+  if (!outputsToAppend.empty())
+    corvusTop.appendOutputs(outputsToAppend);
+
+  // Batch append all inputs
+  auto appendedInputs = corvusTop.appendInputs(inputsToAppend);
+
+  // Replace all uses of results with the new block arguments
+  for (auto [result, inputIdx] : resultToInputIndex)
+    result.replaceAllUsesWith(appendedInputs[inputIdx].second);
 
   for (auto instance : llvm::reverse(instances))
     instance.erase();
@@ -213,6 +232,11 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
   for (auto instance : block.getOps<hw::InstanceOp>())
     instances.push_back(instance);
 
+  // Collect all inputs to append
+  SmallVector<std::pair<StringAttr, Type>> inputsToAppend;
+  // Store mapping from instance operand to input index
+  SmallVector<std::tuple<hw::InstanceOp, unsigned, unsigned>> operandMapping;
+
   unsigned operandCursor = 0;
   for (auto instance : instances) {
     for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
@@ -221,12 +245,21 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
         return failure();
       }
       const BridgePort &port = bridgeOperandPorts[operandCursor++];
-      auto [nameAttr, blockArg] =
-          corvusExternal.appendInput(port.name, port.type);
-      (void)nameAttr;
-      instance.setOperand(idx, blockArg);
+      auto nameAttr = StringAttr::get(corvusExternal.getContext(), port.name);
+      inputsToAppend.push_back({nameAttr, port.type});
+      operandMapping.push_back({instance, idx, inputsToAppend.size() - 1});
     }
   }
+
+  // Batch append all inputs
+  auto appendedInputs = corvusExternal.appendInputs(inputsToAppend);
+
+  // Update instance operands with new block arguments
+  for (auto [instance, operandIdx, inputIdx] : operandMapping)
+    instance.setOperand(operandIdx, appendedInputs[inputIdx].second);
+
+  // Collect all outputs to append
+  SmallVector<std::pair<StringAttr, Value>> outputsToAppend;
 
   unsigned resultCursor = 0;
   for (auto instance : instances) {
@@ -236,9 +269,14 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
         return failure();
       }
       const BridgePort &port = bridgeResultPorts[resultCursor++];
-      corvusExternal.appendOutput(port.name, result);
+      auto nameAttr = StringAttr::get(corvusExternal.getContext(), port.name);
+      outputsToAppend.push_back({nameAttr, result});
     }
   }
+
+  // Batch append all outputs
+  if (!outputsToAppend.empty())
+    corvusExternal.appendOutputs(outputsToAppend);
 
   SmallVector<Operation *, 8> toErase;
   for (auto &op : block.getOperations()) {
