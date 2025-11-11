@@ -18,6 +18,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/HW/HWTypes.h"
@@ -41,9 +42,18 @@ using namespace hw;
 
 namespace {
 
+constexpr unsigned MIN_PORT_WIDTH = 4096;
+
 struct BridgePort {
   std::string name;
   Type type;
+};
+
+struct BridgeAssignment {
+  unsigned portIdx;
+  uint64_t startBit;
+  uint64_t width;
+  bool useBitSlice;
 };
 
 static std::string makeUniqueName(StringRef base, llvm::StringSet<> &used) {
@@ -53,6 +63,26 @@ static std::string makeUniqueName(StringRef base, llvm::StringSet<> &used) {
     candidate = (base + "_" + Twine(++suffix)).str();
   used.insert(candidate);
   return candidate;
+}
+
+static unsigned getIntegerBitWidth(Type type) {
+  auto intType = dyn_cast<IntegerType>(type);
+  if (!intType)
+    return 0;
+  int64_t width = hw::getBitWidth(type);
+  if (width <= 0)
+    return 0;
+  return static_cast<unsigned>(width);
+}
+
+static Value createConcatValue(Location loc, ArrayRef<Value> values,
+                               OpBuilder &builder) {
+  if (values.empty())
+    return Value();
+  if (values.size() == 1)
+    return values.front();
+  SmallVector<Value> reversed(values.rbegin(), values.rend());
+  return builder.createOrFold<comb::ConcatOp>(loc, reversed);
 }
 
 class HWStripExternalModule
@@ -72,6 +102,8 @@ private:
   ModuleOp mlirModuleOp;
   SmallVector<BridgePort, 8> bridgeOperandPorts;
   SmallVector<BridgePort, 8> bridgeResultPorts;
+  SmallVector<BridgeAssignment, 8> operandAssignments;
+  SmallVector<BridgeAssignment, 8> resultAssignments;
   unsigned originalInputCount = 0;
   unsigned originalOutputCount = 0;
 };
@@ -160,6 +192,8 @@ LogicalResult
 HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
   bridgeOperandPorts.clear();
   bridgeResultPorts.clear();
+  operandAssignments.clear();
+  resultAssignments.clear();
 
   llvm::StringSet<> usedInputNames;
   llvm::StringSet<> usedOutputNames;
@@ -175,44 +209,226 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
   for (auto instance : corvusTop.getOps<hw::InstanceOp>())
     instances.push_back(instance);
 
-  // Collect all outputs to append
-  SmallVector<std::pair<StringAttr, Value>> outputsToAppend;
-  // Collect all inputs to append
-  SmallVector<std::pair<StringAttr, Type>> inputsToAppend;
-  // Store mapping from result to input index for later replacement
-  SmallVector<std::pair<Value, unsigned>> resultToInputIndex;
+  SmallVector<Value> operandValues;
+  SmallVector<std::string> operandBaseNames;
+  SmallVector<unsigned> operandWidths;
+  SmallVector<bool> operandBatchable;
+
+  SmallVector<Value> resultValues;
+  SmallVector<std::string> resultBaseNames;
+  SmallVector<unsigned> resultWidths;
+  SmallVector<bool> resultBatchable;
 
   for (auto instance : instances) {
     auto instanceName = instance.getInstanceName().str();
 
     for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
-      std::string base = ("extp_" + instanceName + "_in_" + Twine(idx)).str();
-      std::string uniqueName = makeUniqueName(base, usedOutputNames);
-      auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
-      outputsToAppend.push_back({nameAttr, operand});
-      bridgeOperandPorts.push_back({uniqueName, operand.getType()});
+      operandValues.push_back(operand);
+      operandBaseNames.push_back(
+          ("extp_" + instanceName + "_in_" + Twine(idx)).str());
+      unsigned width = getIntegerBitWidth(operand.getType());
+      operandWidths.push_back(width);
+      operandBatchable.push_back(width != 0);
     }
 
     for (auto [idx, result] : llvm::enumerate(instance.getResults())) {
-      std::string base = ("extp_" + instanceName + "_out_" + Twine(idx)).str();
-      std::string uniqueName = makeUniqueName(base, usedInputNames);
-      auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
-      inputsToAppend.push_back({nameAttr, result.getType()});
-      resultToInputIndex.push_back({result, bridgeResultPorts.size()});
-      bridgeResultPorts.push_back({uniqueName, result.getType()});
+      resultValues.push_back(result);
+      resultBaseNames.push_back(
+          ("extp_" + instanceName + "_out_" + Twine(idx)).str());
+      unsigned width = getIntegerBitWidth(result.getType());
+      resultWidths.push_back(width);
+      resultBatchable.push_back(width != 0);
     }
   }
 
-  // Batch append all outputs
+  operandAssignments.resize(operandValues.size());
+  resultAssignments.resize(resultValues.size());
+
+  Block &block = corvusTop.getBody().front();
+  Operation *terminator = block.getTerminator();
+  OpBuilder concatBuilder(terminator);
+  auto loc = corvusTop.getLoc();
+
+  SmallVector<std::pair<StringAttr, Value>> outputsToAppend;
+  outputsToAppend.reserve(operandValues.size());
+
+  auto addDirectOperandPort = [&](unsigned idx) {
+    std::string uniqueName =
+        makeUniqueName(operandBaseNames[idx], usedOutputNames);
+    auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
+    outputsToAppend.push_back({nameAttr, operandValues[idx]});
+    bridgeOperandPorts.push_back({uniqueName, operandValues[idx].getType()});
+    operandAssignments[idx] = {static_cast<unsigned>(bridgeOperandPorts.size() - 1),
+                               0, operandWidths[idx], false};
+  };
+
+  auto addOperandGroup = [&](unsigned startIdx, unsigned endIdx) {
+    if (startIdx >= endIdx)
+      return;
+    SmallVector<Value> groupValues;
+    groupValues.reserve(endIdx - startIdx);
+    for (unsigned i = startIdx; i < endIdx; ++i)
+      groupValues.push_back(operandValues[i]);
+
+    Value concatValue = createConcatValue(loc, groupValues, concatBuilder);
+    std::string base = operandBaseNames[startIdx] + "_bundle";
+    std::string uniqueName = makeUniqueName(base, usedOutputNames);
+    auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
+    outputsToAppend.push_back({nameAttr, concatValue});
+    bridgeOperandPorts.push_back({uniqueName, concatValue.getType()});
+    unsigned portIdx = bridgeOperandPorts.size() - 1;
+    uint64_t offset = 0;
+    for (unsigned i = startIdx; i < endIdx; ++i) {
+      operandAssignments[i] = {portIdx, offset, operandWidths[i], true};
+      offset += operandWidths[i];
+    }
+  };
+
+  bool operandGroupActive = false;
+  unsigned operandGroupStart = 0;
+  uint64_t operandAccumulatedWidth = 0;
+
+  auto flushOperandGroup = [&](unsigned endIdx) {
+    if (!operandGroupActive)
+      return;
+    addOperandGroup(operandGroupStart, endIdx);
+    operandGroupActive = false;
+    operandAccumulatedWidth = 0;
+  };
+
+  for (unsigned idx = 0, e = operandValues.size(); idx < e; ++idx) {
+    if (!operandBatchable[idx]) {
+      flushOperandGroup(idx);
+      addDirectOperandPort(idx);
+      continue;
+    }
+
+    if (!operandGroupActive) {
+      operandGroupActive = true;
+      operandGroupStart = idx;
+      operandAccumulatedWidth = 0;
+    }
+
+    operandAccumulatedWidth += operandWidths[idx];
+    if (operandAccumulatedWidth >= MIN_PORT_WIDTH)
+      flushOperandGroup(idx + 1);
+  }
+  flushOperandGroup(operandValues.size());
+
   if (!outputsToAppend.empty())
     corvusTop.appendOutputs(outputsToAppend);
 
-  // Batch append all inputs
-  auto appendedInputs = corvusTop.appendInputs(inputsToAppend);
+  SmallVector<std::pair<StringAttr, Type>> inputsToAppend;
+  inputsToAppend.reserve(resultValues.size());
 
-  // Replace all uses of results with the new block arguments
-  for (auto [result, inputIdx] : resultToInputIndex)
-    result.replaceAllUsesWith(appendedInputs[inputIdx].second);
+  auto addDirectResultPort = [&](unsigned idx) {
+    std::string uniqueName =
+        makeUniqueName(resultBaseNames[idx], usedInputNames);
+    auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
+    Type type = resultValues[idx].getType();
+    inputsToAppend.push_back({nameAttr, type});
+    bridgeResultPorts.push_back({uniqueName, type});
+    resultAssignments[idx] = {static_cast<unsigned>(bridgeResultPorts.size() - 1),
+                              0, resultWidths[idx], false};
+  };
+
+  auto addResultGroup = [&](unsigned startIdx, unsigned endIdx) -> LogicalResult {
+    if (startIdx >= endIdx)
+      return success();
+    uint64_t totalWidth = 0;
+    for (unsigned i = startIdx; i < endIdx; ++i)
+      totalWidth += resultWidths[i];
+    if (totalWidth > IntegerType::kMaxWidth) {
+      corvusTop.emitOpError("bridge port exceeds maximum integer width");
+      return failure();
+    }
+    auto type = IntegerType::get(corvusTop.getContext(),
+                                 static_cast<unsigned>(totalWidth));
+    std::string base = resultBaseNames[startIdx] + "_bundle";
+    std::string uniqueName = makeUniqueName(base, usedInputNames);
+    auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
+    inputsToAppend.push_back({nameAttr, type});
+    bridgeResultPorts.push_back({uniqueName, type});
+    unsigned portIdx = bridgeResultPorts.size() - 1;
+    uint64_t offset = 0;
+    for (unsigned i = startIdx; i < endIdx; ++i) {
+      resultAssignments[i] = {portIdx, offset, resultWidths[i], true};
+      offset += resultWidths[i];
+    }
+    return success();
+  };
+
+  bool resultGroupActive = false;
+  unsigned resultGroupStart = 0;
+  uint64_t resultAccumulatedWidth = 0;
+
+  auto flushResultGroup = [&](unsigned endIdx) -> LogicalResult {
+    if (!resultGroupActive)
+      return success();
+    if (failed(addResultGroup(resultGroupStart, endIdx)))
+      return failure();
+    resultGroupActive = false;
+    resultAccumulatedWidth = 0;
+    return success();
+  };
+
+  for (unsigned idx = 0, e = resultValues.size(); idx < e; ++idx) {
+    if (!resultBatchable[idx]) {
+      if (failed(flushResultGroup(idx)))
+        return failure();
+      addDirectResultPort(idx);
+      continue;
+    }
+
+    if (!resultGroupActive) {
+      resultGroupActive = true;
+      resultGroupStart = idx;
+      resultAccumulatedWidth = 0;
+    }
+
+    resultAccumulatedWidth += resultWidths[idx];
+    if (resultAccumulatedWidth >= MIN_PORT_WIDTH)
+      if (failed(flushResultGroup(idx + 1)))
+        return failure();
+  }
+  if (failed(flushResultGroup(resultValues.size())))
+    return failure();
+
+  SmallVector<Value> appendedInputValues;
+  if (!inputsToAppend.empty()) {
+    auto appendedInputs = corvusTop.appendInputs(inputsToAppend);
+    for (auto &entry : appendedInputs)
+      appendedInputValues.push_back(entry.second);
+  }
+
+  for (Value arg : appendedInputValues) {
+    if (!arg) {
+      corvusTop.emitOpError("failed to create bridge input argument");
+      return failure();
+    }
+  }
+
+  OpBuilder extractBuilder(corvusTop.getContext());
+  extractBuilder.setInsertionPointToStart(&block);
+
+  if (!resultAssignments.empty()) {
+    for (auto [idx, result] : llvm::enumerate(resultValues)) {
+      const auto &assign = resultAssignments[idx];
+      if (assign.portIdx >= appendedInputValues.size()) {
+        corvusTop.emitOpError("result bridge information missing");
+        return failure();
+      }
+      Value replacement = appendedInputValues[assign.portIdx];
+      if (!replacement) {
+        corvusTop.emitOpError("result bridge input is null");
+        return failure();
+      }
+      if (assign.useBitSlice)
+        replacement = extractBuilder.createOrFold<comb::ExtractOp>(
+            loc, replacement, assign.startBit, assign.width);
+      result.replaceAllUsesWith(replacement);
+    }
+  }
 
   for (auto instance : llvm::reverse(instances))
     instance.erase();
@@ -225,6 +441,13 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
   Block &block = corvusExternal.getBody().front();
   auto *terminator = block.getTerminator();
 
+  SmallVector<Operation *, 8> originalOpsToErase;
+  for (auto &op : block.getOperations()) {
+    if (isa<hw::InstanceOp>(op) || &op == terminator)
+      continue;
+    originalOpsToErase.push_back(&op);
+  }
+
   unsigned originalInputs = corvusExternal.getNumInputPorts();
   unsigned originalOutputs = corvusExternal.getNumOutputPorts();
 
@@ -232,59 +455,97 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
   for (auto instance : block.getOps<hw::InstanceOp>())
     instances.push_back(instance);
 
-  // Collect all inputs to append
   SmallVector<std::pair<StringAttr, Type>> inputsToAppend;
-  // Store mapping from instance operand to input index
-  SmallVector<std::tuple<hw::InstanceOp, unsigned, unsigned>> operandMapping;
+  inputsToAppend.reserve(bridgeOperandPorts.size());
+  for (const auto &port : bridgeOperandPorts) {
+    auto nameAttr = StringAttr::get(corvusExternal.getContext(), port.name);
+    inputsToAppend.push_back({nameAttr, port.type});
+  }
+
+  SmallVector<Value> bridgeInputArgs;
+  if (!inputsToAppend.empty()) {
+    auto appendedInputs = corvusExternal.appendInputs(inputsToAppend);
+    for (auto &entry : appendedInputs)
+      bridgeInputArgs.push_back(entry.second);
+  }
+
+  for (Value arg : bridgeInputArgs) {
+    if (!arg) {
+      corvusExternal.emitOpError("failed to materialize bridge input arg");
+      return failure();
+    }
+  }
 
   unsigned operandCursor = 0;
   for (auto instance : instances) {
+    auto loc = instance.getLoc();
     for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
-      if (operandCursor >= bridgeOperandPorts.size()) {
+      if (operandCursor >= operandAssignments.size()) {
         instance.emitOpError("operand bridge information missing");
         return failure();
       }
-      const BridgePort &port = bridgeOperandPorts[operandCursor++];
-      auto nameAttr = StringAttr::get(corvusExternal.getContext(), port.name);
-      inputsToAppend.push_back({nameAttr, port.type});
-      operandMapping.push_back({instance, idx, inputsToAppend.size() - 1});
+      const BridgeAssignment &assign = operandAssignments[operandCursor++];
+      if (assign.portIdx >= bridgeInputArgs.size()) {
+        instance.emitOpError("operand bridge port index out of range");
+        return failure();
+      }
+      Value source = bridgeInputArgs[assign.portIdx];
+      Value replacement = source;
+      if (!replacement) {
+        instance.emitOpError("bridge operand is null");
+        return failure();
+      }
+      if (assign.useBitSlice) {
+        OpBuilder builder(instance);
+        builder.setInsertionPoint(instance);
+        replacement = builder.createOrFold<comb::ExtractOp>(
+            loc, source, assign.startBit, assign.width);
+      }
+      instance.setOperand(idx, replacement);
+      if (!instance.getOperand(idx)) {
+        instance.emitOpError("failed to set operand value");
+        return failure();
+      }
     }
   }
 
-  // Batch append all inputs
-  auto appendedInputs = corvusExternal.appendInputs(inputsToAppend);
-
-  // Update instance operands with new block arguments
-  for (auto [instance, operandIdx, inputIdx] : operandMapping)
-    instance.setOperand(operandIdx, appendedInputs[inputIdx].second);
-
-  // Collect all outputs to append
   SmallVector<std::pair<StringAttr, Value>> outputsToAppend;
+  outputsToAppend.reserve(bridgeResultPorts.size());
+  SmallVector<SmallVector<Value>> portValueBuckets(bridgeResultPorts.size());
 
   unsigned resultCursor = 0;
   for (auto instance : instances) {
-    for (auto [idx, result] : llvm::enumerate(instance.getResults())) {
-      if (resultCursor >= bridgeResultPorts.size()) {
+    for (Value result : instance.getResults()) {
+      if (resultCursor >= resultAssignments.size()) {
         instance.emitOpError("result bridge information missing");
         return failure();
       }
-      const BridgePort &port = bridgeResultPorts[resultCursor++];
-      auto nameAttr = StringAttr::get(corvusExternal.getContext(), port.name);
-      outputsToAppend.push_back({nameAttr, result});
+      const BridgeAssignment &assign = resultAssignments[resultCursor++];
+      if (assign.portIdx >= portValueBuckets.size()) {
+        instance.emitOpError("result bridge port index out of range");
+        return failure();
+      }
+      portValueBuckets[assign.portIdx].push_back(result);
     }
   }
 
-  // Batch append all outputs
+  OpBuilder outputBuilder(terminator);
+  auto loc = corvusExternal.getLoc();
+  for (auto [idx, bucket] : llvm::enumerate(portValueBuckets)) {
+    if (bucket.empty()) {
+      corvusExternal.emitOpError("result bridge information missing");
+      return failure();
+    }
+    Value combined = createConcatValue(loc, bucket, outputBuilder);
+    auto nameAttr =
+        StringAttr::get(corvusExternal.getContext(), bridgeResultPorts[idx].name);
+    outputsToAppend.push_back({nameAttr, combined});
+  }
+
   if (!outputsToAppend.empty())
     corvusExternal.appendOutputs(outputsToAppend);
 
-  SmallVector<Operation *, 8> toErase;
-  for (auto &op : block.getOperations()) {
-    if (isa<hw::InstanceOp>(op) || &op == terminator)
-      continue;
-    toErase.push_back(&op);
-  }
-  for (auto *op : toErase) {
+  for (auto *op : originalOpsToErase) {
     op->dropAllUses();
     op->erase();
   }
