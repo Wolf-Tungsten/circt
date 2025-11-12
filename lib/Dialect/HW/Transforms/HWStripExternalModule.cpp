@@ -22,6 +22,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "mlir/IR/SymbolTable.h"
@@ -209,6 +210,11 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
   for (auto instance : corvusTop.getOps<hw::InstanceOp>())
     instances.push_back(instance);
 
+  Block &block = corvusTop.getBody().front();
+  Operation *terminator = block.getTerminator();
+  OpBuilder helperBuilder(terminator);
+  auto loc = corvusTop.getLoc();
+
   SmallVector<Value> operandValues;
   SmallVector<std::string> operandBaseNames;
   SmallVector<unsigned> operandWidths;
@@ -223,10 +229,16 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
     auto instanceName = instance.getInstanceName().str();
 
     for (auto [idx, operand] : llvm::enumerate(instance.getOperands())) {
-      operandValues.push_back(operand);
+      Value bundledOperand = operand;
+      unsigned width = getIntegerBitWidth(operand.getType());
+      if (!width && isa<seq::ClockType>(operand.getType())) {
+        bundledOperand = helperBuilder.createOrFold<seq::FromClockOp>(
+            loc, operand);
+        width = 1;
+      }
+      operandValues.push_back(bundledOperand);
       operandBaseNames.push_back(
           ("extp_" + instanceName + "_in_" + Twine(idx)).str());
-      unsigned width = getIntegerBitWidth(operand.getType());
       operandWidths.push_back(width);
       operandBatchable.push_back(width != 0);
     }
@@ -236,6 +248,8 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
       resultBaseNames.push_back(
           ("extp_" + instanceName + "_out_" + Twine(idx)).str());
       unsigned width = getIntegerBitWidth(result.getType());
+      if (!width && isa<seq::ClockType>(result.getType()))
+        width = 1;
       resultWidths.push_back(width);
       resultBatchable.push_back(width != 0);
     }
@@ -243,11 +257,6 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
 
   operandAssignments.resize(operandValues.size());
   resultAssignments.resize(resultValues.size());
-
-  Block &block = corvusTop.getBody().front();
-  Operation *terminator = block.getTerminator();
-  OpBuilder concatBuilder(terminator);
-  auto loc = corvusTop.getLoc();
 
   SmallVector<std::pair<StringAttr, Value>> outputsToAppend;
   outputsToAppend.reserve(operandValues.size());
@@ -270,7 +279,7 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
     for (unsigned i = startIdx; i < endIdx; ++i)
       groupValues.push_back(operandValues[i]);
 
-    Value concatValue = createConcatValue(loc, groupValues, concatBuilder);
+    Value concatValue = createConcatValue(loc, groupValues, helperBuilder);
     std::string base = operandBaseNames[startIdx] + "_bundle";
     std::string uniqueName = makeUniqueName(base, usedOutputNames);
     auto nameAttr = StringAttr::get(corvusTop.getContext(), uniqueName);
@@ -426,6 +435,10 @@ HWStripExternalModule::rewriteCorvusTop(hw::HWModuleOp corvusTop) {
       if (assign.useBitSlice)
         replacement = extractBuilder.createOrFold<comb::ExtractOp>(
             loc, replacement, assign.startBit, assign.width);
+      if (isa<seq::ClockType>(result.getType()) &&
+          isa<IntegerType>(replacement.getType()))
+        replacement =
+            extractBuilder.createOrFold<seq::ToClockOp>(loc, replacement);
       result.replaceAllUsesWith(replacement);
     }
   }
@@ -495,12 +508,15 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
         instance.emitOpError("bridge operand is null");
         return failure();
       }
-      if (assign.useBitSlice) {
-        OpBuilder builder(instance);
-        builder.setInsertionPoint(instance);
+      OpBuilder builder(instance);
+      builder.setInsertionPoint(instance);
+      if (assign.useBitSlice)
         replacement = builder.createOrFold<comb::ExtractOp>(
             loc, source, assign.startBit, assign.width);
-      }
+      auto expectedType = instance.getOperand(idx).getType();
+      if (isa<seq::ClockType>(expectedType) &&
+          isa<IntegerType>(replacement.getType()))
+        replacement = builder.createOrFold<seq::ToClockOp>(loc, replacement);
       instance.setOperand(idx, replacement);
       if (!instance.getOperand(idx)) {
         instance.emitOpError("failed to set operand value");
@@ -536,7 +552,23 @@ HWStripExternalModule::rewriteCorvusExternal(hw::HWModuleOp corvusExternal) {
       corvusExternal.emitOpError("result bridge information missing");
       return failure();
     }
-    Value combined = createConcatValue(loc, bucket, outputBuilder);
+    bool expectsInteger = isa<IntegerType>(bridgeResultPorts[idx].type);
+    SmallVector<Value> processedValues;
+    processedValues.reserve(bucket.size());
+    for (Value value : bucket) {
+      Value processed = value;
+      if (expectsInteger && !isa<IntegerType>(processed.getType())) {
+        if (isa<seq::ClockType>(processed.getType())) {
+          processed = outputBuilder.createOrFold<seq::FromClockOp>(loc, processed);
+        } else {
+          corvusExternal.emitOpError(
+              "non-integer value encountered while bundling bridge result");
+          return failure();
+        }
+      }
+      processedValues.push_back(processed);
+    }
+    Value combined = createConcatValue(loc, processedValues, outputBuilder);
     auto nameAttr =
         StringAttr::get(corvusExternal.getContext(), bridgeResultPorts[idx].name);
     outputsToAppend.push_back({nameAttr, combined});
