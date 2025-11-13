@@ -1,3 +1,5 @@
+// RUN: circt-opt %s -verify-diagnostics
+
 module {
   sv.macro.decl @SYNTHESIS
   sv.macro.decl @PRINTF_FD
