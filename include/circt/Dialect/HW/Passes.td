@@ -271,4 +271,29 @@ def HWFlattenCorvusTop : Pass<"hw-flatten-corvus-top", "mlir::ModuleOp"> {
   ];
 }
 
+def HWAggregateCorvusPartitions
+    : Pass<"hw-aggregate-corvus-partitions", "mlir::ModuleOp"> {
+  let summary = "Bundle direct __corvus_seq_P*/__corvus_comb_P* connections";
+  let description = [{
+    This pass scans `__corvus_top` for partitioned `__corvus_seq_P*` and
+    `__corvus_comb_P*` instances that exchange signals exclusively with their
+    matching partition. Such one-to-one connections are replaced with a single
+    aggregated bundle port per direction by concatenating the producer signals
+    and extracting them inside the consumer. Instance operands and results are
+    updated accordingly so the behavior is preserved while significantly
+    reducing the inter-partition port count.
+  }];
+  let dependentDialects = ["comb::CombDialect"];
+  let options = [
+    Option<"topModuleName", "top-module-name", "std::string", "\"__corvus_top\"",
+           "Name of the hw.module that instantiates the partition clones">,
+    Option<"seqPartitionPrefix", "seq-partition-prefix", "std::string",
+           "\"__corvus_seq_P\"",
+           "Prefix used to identify sequential partition module names">,
+    Option<"combPartitionPrefix", "comb-partition-prefix", "std::string",
+           "\"__corvus_comb_P\"",
+           "Prefix used to identify combinational partition module names">
+  ];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD

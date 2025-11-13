@@ -736,6 +736,11 @@ LogicalResult processBuffer(
     flattenOptions.seqWrapperName = "__corvus_seq";
     flattenOptions.combWrapperName = "__corvus_comb";
     pm.addPass(hw::createHWFlattenCorvusTop(flattenOptions));
+    hw::HWAggregateCorvusPartitionsOptions aggregateOptions;
+    aggregateOptions.topModuleName = "__corvus_top";
+    aggregateOptions.seqPartitionPrefix = "__corvus_seq_P";
+    aggregateOptions.combPartitionPrefix = "__corvus_comb_P";
+    pm.addPass(hw::createHWAggregateCorvusPartitions(aggregateOptions));
   }
   // Corvus Compiler Pass End
 
