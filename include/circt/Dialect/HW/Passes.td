@@ -252,4 +252,23 @@ def HWPartitionModules : Pass<"hw-partition-modules", "mlir::ModuleOp"> {
   ];
 }
 
+def HWFlattenCorvusTop : Pass<"hw-flatten-corvus-top", "mlir::ModuleOp"> {
+  let summary = "Inline __corvus_seq/__corvus_comb partition wrappers into __corvus_top";
+  let description = [{
+    This pass erases the intermediate `__corvus_seq` and `__corvus_comb`
+    wrappers instantiated by `__corvus_top` by cloning the partitioned `_P*`
+    instances they contain directly into `__corvus_top`. The top-level module
+    retains its original interface and afterwards only contains `hw.instance`
+    operations that instantiate the partition clones.
+  }];
+  let options = [
+    Option<"topModuleName", "top-module-name", "std::string", "\"__corvus_top\"",
+           "Name of the hw.module whose wrapper instances should be flattened">,
+    Option<"seqWrapperName", "seq-wrapper-name", "std::string", "\"__corvus_seq\"",
+           "Name of the sequential wrapper module to inline when instantiated under the top module">,
+    Option<"combWrapperName", "comb-wrapper-name", "std::string", "\"__corvus_comb\"",
+           "Name of the combinational wrapper module to inline when instantiated under the top module">
+  ];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD
