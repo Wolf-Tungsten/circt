@@ -25,9 +25,12 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <string>
@@ -61,12 +64,32 @@ struct SeqToCombSignal {
   Type type;
 };
 
-struct PartitionInfo {
+struct Partition {
   unsigned id = 0;
-  hw::InstanceOp combInstance;
-  hw::InstanceOp seqInstance;
   hw::HWModuleOp combModule;
   hw::HWModuleOp seqModule;
+  hw::InstanceOp combInstance;
+  hw::InstanceOp seqInstance;
+};
+
+struct DiscoveredPartitions {
+  SmallVector<Partition> partitions;
+  DenseMap<unsigned, unsigned> idToIndex;
+  DenseMap<Operation *, unsigned> combInstanceToId;
+  DenseMap<Operation *, unsigned> seqInstanceToId;
+};
+
+struct PartitionPairKey {
+  unsigned combId = 0;
+  unsigned seqId = 0;
+
+  bool operator==(const PartitionPairKey &rhs) const {
+    return combId == rhs.combId && seqId == rhs.seqId;
+  }
+};
+
+struct PartitionPairInfo {
+  PartitionPairKey key;
   SmallVector<CombToSeqSignal> combToSeq;
   SmallVector<SeqToCombSignal> seqToComb;
   StringAttr combToSeqBundleName;
@@ -75,8 +98,33 @@ struct PartitionInfo {
   Type seqToCombBundleType;
 };
 
+struct BundleEndpoint {
+  BundleKind kind;
+  unsigned combId = 0;
+  unsigned seqId = 0;
+  StringAttr name;
+  Type type;
+};
+
+struct InputBundleSpec {
+  BundleEndpoint endpoint;
+  SmallVector<unsigned> portIndices;
+};
+
+struct OutputBundleSpec {
+  BundleEndpoint endpoint;
+  SmallVector<unsigned> portIndices;
+};
+
+struct ModuleBundlePlan {
+  SmallVector<InputBundleSpec> inputs;
+  SmallVector<OutputBundleSpec> outputs;
+};
+
 struct AppendedPortInfo {
   BundleKind kind;
+  unsigned combId = 0;
+  unsigned seqId = 0;
   StringAttr name;
   Type type;
 };
@@ -93,19 +141,67 @@ struct ModuleAggregationResult {
   SmallVector<AppendedPortInfo> appendedOutputs;
 };
 
-struct InputBundleSpec {
-  StringAttr name;
-  Type type;
-  SmallVector<unsigned> portIndices;
-  SmallVector<BlockArgument> arguments;
+static StringAttr makeBundleName(MLIRContext *ctx, BundleKind kind,
+                                 unsigned combId, unsigned seqId) {
+  std::string buffer;
+  llvm::raw_string_ostream os(buffer);
+  if (kind == BundleKind::CombToSeq)
+    os << "CP" << combId << "_to_SP" << seqId;
+  else
+    os << "SP" << seqId << "_to_CP" << combId;
+  return StringAttr::get(ctx, os.str());
+}
+
+static const Partition &
+getPartition(const DiscoveredPartitions &parts, unsigned id) {
+  auto it = parts.idToIndex.find(id);
+  assert(it != parts.idToIndex.end() && "unknown partition id");
+  return parts.partitions[it->second];
+}
+
+struct BundleKey {
+  unsigned combId = 0;
+  unsigned seqId = 0;
+  BundleKind kind = BundleKind::CombToSeq;
+
+  bool operator==(const BundleKey &rhs) const {
+    return combId == rhs.combId && seqId == rhs.seqId && kind == rhs.kind;
+  }
 };
 
-struct OutputBundleSpec {
-  StringAttr name;
-  Type type;
-  SmallVector<unsigned> portIndices;
-  SmallVector<Value> values;
+} // namespace
+
+namespace llvm {
+template <> struct DenseMapInfo<PartitionPairKey> {
+  static inline PartitionPairKey getEmptyKey() { return {~0u, ~0u}; }
+  static inline PartitionPairKey getTombstoneKey() { return {~0u - 1, ~0u - 1}; }
+  static unsigned getHashValue(const PartitionPairKey &key) {
+    return hash_combine(key.combId, key.seqId);
+  }
+  static bool isEqual(const PartitionPairKey &lhs,
+                      const PartitionPairKey &rhs) {
+    return lhs == rhs;
+  }
 };
+
+template <> struct DenseMapInfo<BundleKey> {
+  static inline BundleKey getEmptyKey() {
+    return {~0u, ~0u, BundleKind::CombToSeq};
+  }
+  static inline BundleKey getTombstoneKey() {
+    return {~0u - 1, ~0u - 1, BundleKind::CombToSeq};
+  }
+  static unsigned getHashValue(const BundleKey &key) {
+    return hash_combine(key.combId, key.seqId,
+                        static_cast<unsigned>(key.kind));
+  }
+  static bool isEqual(const BundleKey &lhs, const BundleKey &rhs) {
+    return lhs == rhs;
+  }
+};
+} // namespace llvm
+
+namespace {
 
 static std::optional<unsigned> parsePartitionId(StringRef name,
                                                 StringRef prefix) {
@@ -221,22 +317,21 @@ struct HWAggregateCorvusPortsPass
   void runOnOperation() override;
 
 private:
+  LogicalResult discoverPartitions(ModuleOp module, hw::HWModuleOp topModule,
+                                   DiscoveredPartitions &partitions);
   LogicalResult
-  discoverPartitions(ModuleOp module, hw::HWModuleOp topModule,
-                     SmallVectorImpl<PartitionInfo> &partitions,
-                     SymbolTable &symbolTable);
-  LogicalResult analyzeDirectSignals(PartitionInfo &info);
-  LogicalResult rewriteModuleForPartition(PartitionInfo &info,
-                                          DenseMap<hw::HWModuleOp,
-                                                   ModuleAggregationResult> &);
+  collectPartitionPairs(const DiscoveredPartitions &partitions,
+                        SmallVectorImpl<PartitionPairInfo> &pairs);
+  LogicalResult
+  buildModulePlans(const DiscoveredPartitions &partitions,
+                   ArrayRef<PartitionPairInfo> pairs,
+                   DenseMap<hw::HWModuleOp, ModuleBundlePlan> &plans);
   LogicalResult rewriteModule(hw::HWModuleOp module,
-                              std::optional<InputBundleSpec> inputSpec,
-                              std::optional<OutputBundleSpec> outputSpec,
-                              BundleKind inputKind, BundleKind outputKind,
+                              const ModuleBundlePlan &plan,
                               ModuleAggregationResult &result);
   LogicalResult
   rewriteTopInstances(hw::HWModuleOp topModule,
-                      ArrayRef<PartitionInfo> partitions,
+                      const DiscoveredPartitions &partitions,
                       DenseMap<hw::HWModuleOp, ModuleAggregationResult> &results);
 };
 
@@ -252,42 +347,45 @@ void HWAggregateCorvusPortsPass::runOnOperation() {
   auto topModule =
       symbolTable.lookup<hw::HWModuleOp>(StringAttr::get(module.getContext(),
                                                          topModuleName));
-  if (!topModule) {
-    module.emitError("could not find hw.module named '") << topModuleName
-                                                         << "'";
+  if (!topModule)
+    return;
+
+  DiscoveredPartitions partitions;
+  if (failed(discoverPartitions(module, topModule, partitions))) {
     signalPassFailure();
     return;
   }
 
-  SmallVector<PartitionInfo> partitions;
-  if (failed(discoverPartitions(module, topModule, partitions, symbolTable))) {
+  if (partitions.partitions.empty())
+    return;
+
+  SmallVector<PartitionPairInfo> pairs;
+  if (failed(collectPartitionPairs(partitions, pairs))) {
     signalPassFailure();
     return;
   }
+  if (pairs.empty())
+    return;
 
-  if (partitions.empty())
+  DenseMap<hw::HWModuleOp, ModuleBundlePlan> plans;
+  if (failed(buildModulePlans(partitions, pairs, plans))) {
+    signalPassFailure();
+    return;
+  }
+  if (plans.empty())
     return;
 
   DenseMap<hw::HWModuleOp, ModuleAggregationResult> moduleResults;
-  for (PartitionInfo &info : partitions) {
-    if (failed(analyzeDirectSignals(info))) {
+  for (auto &plan : plans) {
+    ModuleAggregationResult result;
+    if (failed(rewriteModule(plan.first, plan.second, result))) {
       signalPassFailure();
       return;
     }
+    moduleResults.try_emplace(plan.first, std::move(result));
   }
 
-  bool changed = false;
-  for (PartitionInfo &info : partitions) {
-    if (info.combToSeq.empty() && info.seqToComb.empty())
-      continue;
-    if (failed(rewriteModuleForPartition(info, moduleResults))) {
-      signalPassFailure();
-      return;
-    }
-    changed = true;
-  }
-
-  if (!changed)
+  if (moduleResults.empty())
     return;
 
   if (failed(rewriteTopInstances(topModule, partitions, moduleResults)))
@@ -296,26 +394,25 @@ void HWAggregateCorvusPortsPass::runOnOperation() {
 
 LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
     ModuleOp module, hw::HWModuleOp topModule,
-    SmallVectorImpl<PartitionInfo> &partitions, SymbolTable &symbolTable) {
-  (void)symbolTable;
+    DiscoveredPartitions &partitions) {
+  StringRef combPrefix = combPartitionPrefix.empty()
+                             ? "__corvus_comb_P"
+                             : StringRef(combPartitionPrefix);
+  StringRef seqPrefix = seqPartitionPrefix.empty()
+                            ? "__corvus_seq_P"
+                            : StringRef(seqPartitionPrefix);
+
   DenseMap<unsigned, hw::HWModuleOp> combModules;
   DenseMap<unsigned, hw::HWModuleOp> seqModules;
-
   for (hw::HWModuleOp mod : module.getOps<hw::HWModuleOp>()) {
     StringRef name = mod.getModuleName();
-    if (auto combId =
-            parsePartitionId(name, combPartitionPrefix.empty()
-                                      ? "__corvus_comb_P"
-                                      : StringRef(combPartitionPrefix))) {
+    if (auto combId = parsePartitionId(name, combPrefix)) {
       if (!combModules.try_emplace(*combId, mod).second)
         return mod.emitOpError("duplicate __corvus_comb partition id ")
                << *combId;
       continue;
     }
-    if (auto seqId =
-            parsePartitionId(name, seqPartitionPrefix.empty()
-                                      ? "__corvus_seq_P"
-                                      : StringRef(seqPartitionPrefix))) {
+    if (auto seqId = parsePartitionId(name, seqPrefix)) {
       if (!seqModules.try_emplace(*seqId, mod).second)
         return mod.emitOpError("duplicate __corvus_seq partition id ")
                << *seqId;
@@ -324,224 +421,265 @@ LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
 
   DenseMap<unsigned, hw::InstanceOp> combInstances;
   DenseMap<unsigned, hw::InstanceOp> seqInstances;
-
   for (Operation &op : topModule.getBodyBlock()->without_terminator()) {
     auto inst = dyn_cast<hw::InstanceOp>(&op);
     if (!inst)
       continue;
     StringRef target = inst.getReferencedModuleName();
-    if (auto combId =
-            parsePartitionId(target, combPartitionPrefix.empty()
-                                          ? "__corvus_comb_P"
-                                          : StringRef(combPartitionPrefix))) {
+    if (auto combId = parsePartitionId(target, combPrefix)) {
       if (!combInstances.try_emplace(*combId, inst).second)
         return inst.emitOpError("duplicated __corvus_comb instance for id ")
                << *combId;
       continue;
     }
-    if (auto seqId =
-            parsePartitionId(target, seqPartitionPrefix.empty()
-                                          ? "__corvus_seq_P"
-                                          : StringRef(seqPartitionPrefix))) {
+    if (auto seqId = parsePartitionId(target, seqPrefix)) {
       if (!seqInstances.try_emplace(*seqId, inst).second)
         return inst.emitOpError("duplicated __corvus_seq instance for id ")
                << *seqId;
     }
   }
 
-  llvm::SmallVector<unsigned> ids;
-  ids.reserve(combInstances.size());
-  for (auto &pair : combInstances)
-    if (seqInstances.contains(pair.first))
-      ids.push_back(pair.first);
+  for (auto &it : combInstances)
+    if (!combModules.contains(it.first))
+      return it.second.emitOpError(
+          "referenced __corvus_comb module not found for partition id ")
+             << it.first;
+  for (auto &it : seqInstances)
+    if (!seqModules.contains(it.first))
+      return it.second.emitOpError(
+          "referenced __corvus_seq module not found for partition id ")
+             << it.first;
+
+  for (auto &it : combModules)
+    if (!seqModules.contains(it.first))
+      return it.second.emitOpError(
+                 "missing __corvus_seq module for partition id ")
+             << it.first;
+  for (auto &it : seqModules)
+    if (!combModules.contains(it.first))
+      return it.second.emitOpError(
+                 "missing __corvus_comb module for partition id ")
+             << it.first;
+
+  for (auto &it : combModules)
+    if (!combInstances.contains(it.first))
+      return topModule.emitOpError("missing __corvus_comb instance for id ")
+             << it.first;
+  for (auto &it : seqModules)
+    if (!seqInstances.contains(it.first))
+      return topModule.emitOpError("missing __corvus_seq instance for id ")
+             << it.first;
+
+  SmallVector<unsigned> ids;
+  ids.reserve(combModules.size());
+  for (auto &pair : combModules)
+    ids.push_back(pair.first);
   llvm::sort(ids);
 
-  OpBuilder builder(module.getContext());
   for (unsigned id : ids) {
-    PartitionInfo info;
-    info.id = id;
-    info.combInstance = combInstances.lookup(id);
-    info.seqInstance = seqInstances.lookup(id);
-    info.combModule = combModules.lookup(id);
-    info.seqModule = seqModules.lookup(id);
-    if (!info.combModule || !info.seqModule) {
-      module.emitError("missing partition module definition for id ")
-          << id;
-      return failure();
-    }
-
-    std::string comb2seqName;
-    llvm::raw_string_ostream(comb2seqName)
-        << "__corvus_bundle_c2s_P" << id;
-    std::string seq2combName;
-    llvm::raw_string_ostream(seq2combName)
-        << "__corvus_bundle_s2c_P" << id;
-
-    info.combToSeqBundleName =
-        builder.getStringAttr(comb2seqName);
-    info.seqToCombBundleName =
-        builder.getStringAttr(seq2combName);
-    partitions.push_back(info);
+    Partition entry;
+    entry.id = id;
+    entry.combModule = combModules.lookup(id);
+    entry.seqModule = seqModules.lookup(id);
+    entry.combInstance = combInstances.lookup(id);
+    entry.seqInstance = seqInstances.lookup(id);
+    partitions.idToIndex.try_emplace(id, partitions.partitions.size());
+    partitions.partitions.push_back(entry);
+    partitions.combInstanceToId[entry.combInstance.getOperation()] = id;
+    partitions.seqInstanceToId[entry.seqInstance.getOperation()] = id;
   }
   return success();
 }
 
-LogicalResult
-HWAggregateCorvusPortsPass::analyzeDirectSignals(PartitionInfo &info) {
-  if (!info.combInstance || !info.seqInstance)
+LogicalResult HWAggregateCorvusPortsPass::collectPartitionPairs(
+    const DiscoveredPartitions &partitions,
+    SmallVectorImpl<PartitionPairInfo> &pairs) {
+  pairs.clear();
+  if (partitions.partitions.empty())
     return success();
 
-  for (auto [idx, result] : llvm::enumerate(info.combInstance.getResults())) {
-    if (!result.hasOneUse())
-      continue;
-    OpOperand &use = *result.use_begin();
-    if (use.getOwner() != info.seqInstance)
-      continue;
-    unsigned operandIdx = use.getOperandNumber();
-    info.combToSeq.push_back(
-        CombToSeqSignal{static_cast<unsigned>(idx), operandIdx,
-                        result.getType()});
-  }
+  hw::HWModuleOp sampleModule = partitions.partitions.front().combModule;
+  MLIRContext *ctx = sampleModule.getContext();
+  DenseMap<PartitionPairKey, PartitionPairInfo> pairMap;
 
-  for (auto [idx, result] : llvm::enumerate(info.seqInstance.getResults())) {
-    if (!result.hasOneUse())
-      continue;
-    OpOperand &use = *result.use_begin();
-    if (use.getOwner() != info.combInstance)
-      continue;
-    unsigned operandIdx = use.getOperandNumber();
-    info.seqToComb.push_back(
-        SeqToCombSignal{static_cast<unsigned>(idx), operandIdx,
-                        result.getType()});
-  }
-
-  auto typeBuilder = OpBuilder(info.combModule.getContext());
-
-  if (!info.combToSeq.empty()) {
-    SmallVector<Type> types;
-    for (auto &signal : info.combToSeq)
-      types.push_back(signal.type);
-    auto typeOrErr =
-        buildBundleType(info.combModule.getLoc(), types, typeBuilder);
-    if (failed(typeOrErr))
-      return failure();
-    info.combToSeqBundleType = *typeOrErr;
-  }
-
-  if (!info.seqToComb.empty()) {
-    SmallVector<Type> types;
-    for (auto &signal : info.seqToComb)
-      types.push_back(signal.type);
-    auto typeOrErr =
-        buildBundleType(info.seqModule.getLoc(), types, typeBuilder);
-    if (failed(typeOrErr))
-      return failure();
-    info.seqToCombBundleType = *typeOrErr;
-  }
-
-  return success();
-}
-
-LogicalResult HWAggregateCorvusPortsPass::rewriteModuleForPartition(
-    PartitionInfo &info,
-    DenseMap<hw::HWModuleOp, ModuleAggregationResult> &moduleResults) {
-  auto tryRewrite = [&](hw::HWModuleOp module, bool isComb) -> LogicalResult {
-    if (moduleResults.contains(module))
-      return success();
-
-    std::optional<InputBundleSpec> inputSpec;
-    std::optional<OutputBundleSpec> outputSpec;
-
-    Block *body = module.getBodyBlock();
-    auto outputOp = cast<hw::OutputOp>(body->getTerminator());
-
-    if (isComb && !info.seqToComb.empty()) {
-      llvm::sort(info.seqToComb,
-                 [](const SeqToCombSignal &a, const SeqToCombSignal &b) {
-                   return a.combInputIdx < b.combInputIdx;
-                 });
-      InputBundleSpec spec;
-      spec.name = info.seqToCombBundleName;
-      spec.type = info.seqToCombBundleType;
-      for (auto &signal : info.seqToComb) {
-        spec.portIndices.push_back(signal.combInputIdx);
-        spec.arguments.push_back(body->getArgument(signal.combInputIdx));
-      }
-      inputSpec = spec;
+  auto getPair = [&](unsigned combId,
+                     unsigned seqId) -> PartitionPairInfo & {
+    PartitionPairKey key{combId, seqId};
+    auto [it, inserted] = pairMap.try_emplace(key);
+    if (inserted) {
+      it->second.key = key;
+      it->second.combToSeqBundleName =
+          makeBundleName(ctx, BundleKind::CombToSeq, combId, seqId);
+      it->second.seqToCombBundleName =
+          makeBundleName(ctx, BundleKind::SeqToComb, combId, seqId);
     }
+    return it->second;
+  };
 
-    if (isComb && !info.combToSeq.empty()) {
+  for (const Partition &part : partitions.partitions) {
+    unsigned combId = part.id;
+    hw::InstanceOp combInst = part.combInstance;
+    for (auto [idx, result] : llvm::enumerate(combInst.getResults())) {
+      if (!result.hasOneUse())
+        continue;
+      OpOperand &use = *result.use_begin();
+      auto consumerInst = dyn_cast<hw::InstanceOp>(use.getOwner());
+      if (!consumerInst)
+        continue;
+      auto seqIt =
+          partitions.seqInstanceToId.find(consumerInst.getOperation());
+      if (seqIt == partitions.seqInstanceToId.end())
+        continue;
+      unsigned seqId = seqIt->second;
+      auto &info = getPair(combId, seqId);
+      info.combToSeq.push_back(
+          CombToSeqSignal{static_cast<unsigned>(idx),
+                          static_cast<unsigned>(use.getOperandNumber()),
+                          result.getType()});
+    }
+  }
+
+  for (const Partition &part : partitions.partitions) {
+    unsigned seqId = part.id;
+    hw::InstanceOp seqInst = part.seqInstance;
+    for (auto [idx, result] : llvm::enumerate(seqInst.getResults())) {
+      if (!result.hasOneUse())
+        continue;
+      OpOperand &use = *result.use_begin();
+      auto consumerInst = dyn_cast<hw::InstanceOp>(use.getOwner());
+      if (!consumerInst)
+        continue;
+      auto combIt =
+          partitions.combInstanceToId.find(consumerInst.getOperation());
+      if (combIt == partitions.combInstanceToId.end())
+        continue;
+      unsigned combId = combIt->second;
+      auto &info = getPair(combId, seqId);
+      info.seqToComb.push_back(
+          SeqToCombSignal{static_cast<unsigned>(idx),
+                          static_cast<unsigned>(use.getOperandNumber()),
+                          result.getType()});
+    }
+  }
+
+  OpBuilder typeBuilder(ctx);
+  for (auto &it : pairMap) {
+    PartitionPairInfo &info = it.second;
+    if (info.combToSeq.empty() && info.seqToComb.empty())
+      continue;
+
+    if (!info.combToSeq.empty()) {
       llvm::sort(info.combToSeq,
                  [](const CombToSeqSignal &a, const CombToSeqSignal &b) {
                    return a.combOutputIdx < b.combOutputIdx;
                  });
-      OutputBundleSpec spec;
-      spec.name = info.combToSeqBundleName;
-      spec.type = info.combToSeqBundleType;
-      for (auto &signal : info.combToSeq) {
-        spec.portIndices.push_back(signal.combOutputIdx);
-        spec.values.push_back(outputOp.getOperand(signal.combOutputIdx));
-      }
-      outputSpec = spec;
+      SmallVector<Type> types;
+      types.reserve(info.combToSeq.size());
+      for (auto &signal : info.combToSeq)
+        types.push_back(signal.type);
+      const Partition &combPart = getPartition(partitions, info.key.combId);
+      hw::HWModuleOp combModule = combPart.combModule;
+      auto typeOr =
+          buildBundleType(combModule.getLoc(), types, typeBuilder);
+      if (failed(typeOr))
+        return failure();
+      info.combToSeqBundleType = *typeOr;
     }
 
-    if (!isComb && !info.combToSeq.empty()) {
-      llvm::sort(info.combToSeq,
-                 [](const CombToSeqSignal &a, const CombToSeqSignal &b) {
-                   return a.seqInputIdx < b.seqInputIdx;
-                 });
-      InputBundleSpec spec;
-      spec.name = info.combToSeqBundleName;
-      spec.type = info.combToSeqBundleType;
-      for (auto &signal : info.combToSeq) {
-        spec.portIndices.push_back(signal.seqInputIdx);
-        spec.arguments.push_back(body->getArgument(signal.seqInputIdx));
-      }
-      inputSpec = spec;
-    }
-
-    if (!isComb && !info.seqToComb.empty()) {
+    if (!info.seqToComb.empty()) {
       llvm::sort(info.seqToComb,
                  [](const SeqToCombSignal &a, const SeqToCombSignal &b) {
                    return a.seqOutputIdx < b.seqOutputIdx;
                  });
-      OutputBundleSpec spec;
-      spec.name = info.seqToCombBundleName;
-      spec.type = info.seqToCombBundleType;
-      for (auto &signal : info.seqToComb) {
-        spec.portIndices.push_back(signal.seqOutputIdx);
-        spec.values.push_back(outputOp.getOperand(signal.seqOutputIdx));
-      }
-      outputSpec = spec;
+      SmallVector<Type> types;
+      types.reserve(info.seqToComb.size());
+      for (auto &signal : info.seqToComb)
+        types.push_back(signal.type);
+      const Partition &seqPart = getPartition(partitions, info.key.seqId);
+      hw::HWModuleOp seqModule = seqPart.seqModule;
+      auto typeOr =
+          buildBundleType(seqModule.getLoc(), types, typeBuilder);
+      if (failed(typeOr))
+        return failure();
+      info.seqToCombBundleType = *typeOr;
     }
 
-    if (!inputSpec && !outputSpec)
-      return success();
+    pairs.push_back(info);
+  }
 
-    ModuleAggregationResult result;
-    result.module = module;
-    if (failed(rewriteModule(module, inputSpec, outputSpec,
-                             isComb ? BundleKind::SeqToComb
-                                    : BundleKind::CombToSeq,
-                             isComb ? BundleKind::CombToSeq
-                                    : BundleKind::SeqToComb,
-                             result)))
-      return failure();
-    moduleResults.insert({module, result});
-    return success();
+  return success();
+}
+
+LogicalResult HWAggregateCorvusPortsPass::buildModulePlans(
+    const DiscoveredPartitions &partitions,
+    ArrayRef<PartitionPairInfo> pairs,
+    DenseMap<hw::HWModuleOp, ModuleBundlePlan> &plans) {
+  plans.clear();
+  auto sortSpecs = [](auto &specs) {
+    llvm::sort(specs, [](const auto &lhs, const auto &rhs) {
+      if (lhs.endpoint.combId != rhs.endpoint.combId)
+        return lhs.endpoint.combId < rhs.endpoint.combId;
+      if (lhs.endpoint.seqId != rhs.endpoint.seqId)
+        return lhs.endpoint.seqId < rhs.endpoint.seqId;
+      return static_cast<unsigned>(lhs.endpoint.kind) <
+             static_cast<unsigned>(rhs.endpoint.kind);
+    });
   };
 
-  if (failed(tryRewrite(info.combModule, /*isComb=*/true)))
-    return failure();
-  if (failed(tryRewrite(info.seqModule, /*isComb=*/false)))
-    return failure();
+  for (const PartitionPairInfo &info : pairs) {
+    const Partition &combPart = getPartition(partitions, info.key.combId);
+    const Partition &seqPart = getPartition(partitions, info.key.seqId);
+
+    if (!info.combToSeq.empty()) {
+      BundleEndpoint endpoint{BundleKind::CombToSeq, info.key.combId,
+                              info.key.seqId, info.combToSeqBundleName,
+                              info.combToSeqBundleType};
+
+      OutputBundleSpec combOutput{endpoint};
+      combOutput.portIndices.reserve(info.combToSeq.size());
+      for (const auto &signal : info.combToSeq)
+        combOutput.portIndices.push_back(signal.combOutputIdx);
+      plans[combPart.combModule].outputs.push_back(std::move(combOutput));
+
+      InputBundleSpec seqInput{endpoint};
+      seqInput.portIndices.reserve(info.combToSeq.size());
+      for (const auto &signal : info.combToSeq)
+        seqInput.portIndices.push_back(signal.seqInputIdx);
+      plans[seqPart.seqModule].inputs.push_back(std::move(seqInput));
+    }
+
+    if (!info.seqToComb.empty()) {
+      BundleEndpoint endpoint{BundleKind::SeqToComb, info.key.combId,
+                              info.key.seqId, info.seqToCombBundleName,
+                              info.seqToCombBundleType};
+
+      OutputBundleSpec seqOutput{endpoint};
+      seqOutput.portIndices.reserve(info.seqToComb.size());
+      for (const auto &signal : info.seqToComb)
+        seqOutput.portIndices.push_back(signal.seqOutputIdx);
+      plans[seqPart.seqModule].outputs.push_back(std::move(seqOutput));
+
+      InputBundleSpec combInput{endpoint};
+      combInput.portIndices.reserve(info.seqToComb.size());
+      for (const auto &signal : info.seqToComb)
+        combInput.portIndices.push_back(signal.combInputIdx);
+      plans[combPart.combModule].inputs.push_back(std::move(combInput));
+    }
+  }
+
+  for (auto &entry : plans) {
+    sortSpecs(entry.second.inputs);
+    sortSpecs(entry.second.outputs);
+  }
   return success();
 }
 
 LogicalResult HWAggregateCorvusPortsPass::rewriteModule(
-    hw::HWModuleOp module, std::optional<InputBundleSpec> inputSpec,
-    std::optional<OutputBundleSpec> outputSpec, BundleKind inputKind,
-    BundleKind outputKind, ModuleAggregationResult &result) {
+    hw::HWModuleOp module, const ModuleBundlePlan &plan,
+    ModuleAggregationResult &result) {
+  if (plan.inputs.empty() && plan.outputs.empty())
+    return success();
+
   Block *body = module.getBodyBlock();
   auto outputOp = cast<hw::OutputOp>(body->getTerminator());
   OpBuilder builder(module.getContext());
@@ -553,52 +691,75 @@ LogicalResult HWAggregateCorvusPortsPass::rewriteModule(
   SmallVector<unsigned> inputsToErase;
   SmallVector<unsigned> outputsToErase;
 
-  if (outputSpec) {
-    SmallVector<Type> types;
-    for (Value val : outputSpec->values)
-      types.push_back(val.getType());
+  if (!plan.outputs.empty()) {
     builder.setInsertionPoint(outputOp);
-    auto packedOr = packValues(module.getLoc(), builder, outputSpec->values,
-                               types);
-    if (failed(packedOr))
-      return failure();
-    StringAttr name = outputSpec->name;
-    module.appendOutputs({{name, *packedOr}});
-    outputsToErase.assign(outputSpec->portIndices.begin(),
-                          outputSpec->portIndices.end());
-    result.appendedOutputs.push_back(
-        {outputKind, name, outputSpec->type});
+    for (const auto &spec : plan.outputs) {
+      unsigned insertIndex = module.getNumOutputPorts();
+      SmallVector<Value> values;
+      SmallVector<Type> types;
+      values.reserve(spec.portIndices.size());
+      types.reserve(spec.portIndices.size());
+      for (unsigned idx : spec.portIndices) {
+        Value val = outputOp.getOperand(idx);
+        values.push_back(val);
+        types.push_back(val.getType());
+      }
+      auto packedOr = packValues(module.getLoc(), builder, values, types);
+      if (failed(packedOr))
+        return failure();
+      module.appendOutputs({{spec.endpoint.name, *packedOr}});
+      StringAttr actualName = StringAttr::get(
+          module.getContext(), module.getOutputName(insertIndex));
+      outputsToErase.append(spec.portIndices.begin(), spec.portIndices.end());
+      result.appendedOutputs.push_back(
+          {spec.endpoint.kind, spec.endpoint.combId, spec.endpoint.seqId,
+           actualName, spec.endpoint.type});
+    }
   }
 
-  if (inputSpec) {
-    auto inserted = module.insertInputs(
-        module.getNumInputPorts(),
-        {{inputSpec->name, inputSpec->type}});
-    Value aggregate = inserted.front().second;
-    builder.setInsertionPointToStart(body);
-    int64_t offset = 0;
-    for (auto [arg, idx] :
-         llvm::zip(inputSpec->arguments, inputSpec->portIndices)) {
-      auto sliceOr =
-          extractSlice(module.getLoc(), builder, aggregate, arg.getType(),
-                       offset);
-      if (failed(sliceOr))
-        return failure();
-      arg.replaceAllUsesWith(*sliceOr);
-      offset += hw::getBitWidth(arg.getType());
+  if (!plan.inputs.empty()) {
+    for (const auto &spec : plan.inputs) {
+      auto inserted = module.insertInputs(module.getNumInputPorts(),
+                                          {{spec.endpoint.name,
+                                            spec.endpoint.type}});
+      Value aggregate = inserted.front().second;
+      StringAttr actualName = inserted.front().first;
+      builder.setInsertionPointToStart(body);
+      int64_t offset = 0;
+      for (unsigned idx : spec.portIndices) {
+        BlockArgument arg = body->getArgument(idx);
+        auto sliceOr =
+            extractSlice(module.getLoc(), builder, aggregate, arg.getType(),
+                         offset);
+        if (failed(sliceOr))
+          return failure();
+        arg.replaceAllUsesWith(*sliceOr);
+        int64_t width = hw::getBitWidth(arg.getType());
+        if (width <= 0) {
+          module.emitOpError("cannot determine bitwidth for type ")
+              << arg.getType();
+          return failure();
+        }
+        offset += width;
+      }
+      inputsToErase.append(spec.portIndices.begin(), spec.portIndices.end());
+      result.appendedInputs.push_back(
+          {spec.endpoint.kind, spec.endpoint.combId, spec.endpoint.seqId,
+           actualName, spec.endpoint.type});
     }
-    inputsToErase.assign(inputSpec->portIndices.begin(),
-                         inputSpec->portIndices.end());
-    result.appendedInputs.push_back(
-        {inputKind, inputSpec->name, inputSpec->type});
   }
+
+  auto dedupSort = [](SmallVector<unsigned> &values) {
+    llvm::sort(values);
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+  };
+  dedupSort(inputsToErase);
+  dedupSort(outputsToErase);
 
   module.modifyPorts({}, {}, inputsToErase, outputsToErase);
   eraseArguments(body, inputsToErase);
   eraseOperands(outputOp, outputsToErase);
 
-  llvm::sort(inputsToErase);
-  llvm::sort(outputsToErase);
   result.removedInputs = inputsToErase;
   result.removedOutputs = outputsToErase;
   result.oldInputToNew =
@@ -609,176 +770,141 @@ LogicalResult HWAggregateCorvusPortsPass::rewriteModule(
 }
 
 LogicalResult HWAggregateCorvusPortsPass::rewriteTopInstances(
-    hw::HWModuleOp topModule, ArrayRef<PartitionInfo> partitions,
+    hw::HWModuleOp topModule, const DiscoveredPartitions &partitions,
     DenseMap<hw::HWModuleOp, ModuleAggregationResult> &results) {
-  for (const PartitionInfo &info : partitions) {
-    auto combIt = results.find(info.combModule);
-    auto seqIt = results.find(info.seqModule);
-    if (combIt == results.end() && seqIt == results.end())
-      continue;
+  if (results.empty())
+    return success();
 
-    auto rewriteInstance = [&](hw::InstanceOp inst,
-                               const ModuleAggregationResult &modResult,
-                               ArrayRef<Value> appendedOperands,
-                               ArrayRef<StringAttr> appendedOperandNames,
-                               ArrayRef<StringAttr> appendedResultNames)
-        -> hw::InstanceOp {
-      SmallVector<Value> newOperands;
-      newOperands.reserve(modResult.oldInputToNew.size() +
-                          appendedOperands.size());
-      for (auto [idx, value] : llvm::enumerate(inst.getOperands()))
+  OpBuilder edgeOpBuilder(topModule.getBodyBlock(),
+                          topModule.getBodyBlock()->begin());
+  BackedgeBuilder edgeBuilder(edgeOpBuilder, topModule.getLoc());
+
+  DenseMap<BundleKey, Value> producedBundles;
+  DenseMap<BundleKey, SmallVector<Backedge>> pendingBundles;
+
+  auto getOperand = [&](const AppendedPortInfo &endpoint) -> Value {
+    if (!endpoint.type)
+      llvm::report_fatal_error("bundle endpoint missing type");
+    BundleKey key{endpoint.combId, endpoint.seqId, endpoint.kind};
+    if (auto it = producedBundles.find(key); it != producedBundles.end())
+      return it->second;
+    edgeOpBuilder.setInsertionPointToStart(topModule.getBodyBlock());
+    Backedge edge = edgeBuilder.get(endpoint.type);
+    pendingBundles[key].push_back(edge);
+    return edge;
+  };
+
+  auto recordOutput = [&](const AppendedPortInfo &endpoint, Value value) {
+    BundleKey key{endpoint.combId, endpoint.seqId, endpoint.kind};
+    producedBundles[key] = value;
+    if (auto it = pendingBundles.find(key); it != pendingBundles.end()) {
+      for (Backedge edge : it->second)
+        edge.setValue(value);
+      pendingBundles.erase(it);
+    }
+  };
+
+  auto rewriteInstance = [&](hw::InstanceOp inst,
+                             ModuleAggregationResult &modResult) {
+    SmallVector<Value> appendedOperands;
+    appendedOperands.reserve(modResult.appendedInputs.size());
+    for (const auto &endpoint : modResult.appendedInputs)
+      appendedOperands.push_back(getOperand(endpoint));
+
+    SmallVector<StringAttr> appendedOperandNames;
+    appendedOperandNames.reserve(modResult.appendedInputs.size());
+    for (const auto &endpoint : modResult.appendedInputs)
+      appendedOperandNames.push_back(endpoint.name);
+
+    SmallVector<StringAttr> appendedResultNames;
+    appendedResultNames.reserve(modResult.appendedOutputs.size());
+    for (const auto &endpoint : modResult.appendedOutputs)
+      appendedResultNames.push_back(endpoint.name);
+
+    SmallVector<Value> newOperands;
+    newOperands.reserve(modResult.oldInputToNew.size() +
+                        appendedOperands.size());
+    for (auto [idx, value] : llvm::enumerate(inst.getOperands()))
+      if (modResult.oldInputToNew[idx] != kInvalidIndex)
+        newOperands.push_back(value);
+    newOperands.append(appendedOperands.begin(), appendedOperands.end());
+
+    ImplicitLocOpBuilder builder(inst.getLoc(), inst);
+    auto newInst = hw::InstanceOp::create(
+        builder, modResult.module, inst.getInstanceNameAttr(), newOperands,
+        inst.getParameters(), inst.getInnerSymAttr());
+    newInst->setDialectAttrs(inst->getDialectAttrs());
+    if (inst.getDoNotPrintAttr())
+      newInst.setDoNotPrintAttr(inst.getDoNotPrintAttr());
+
+    if (auto argNames = inst.getArgNamesAttr()) {
+      SmallVector<Attribute> names;
+      names.reserve(newOperands.size());
+      for (auto [idx, attr] : llvm::enumerate(argNames))
         if (modResult.oldInputToNew[idx] != kInvalidIndex)
-          newOperands.push_back(value);
-      newOperands.append(appendedOperands.begin(), appendedOperands.end());
+          names.push_back(attr);
+      names.append(appendedOperandNames.begin(), appendedOperandNames.end());
+      newInst.setArgNamesAttr(ArrayAttr::get(inst.getContext(), names));
+    }
 
-      ImplicitLocOpBuilder builder(inst.getLoc(), inst);
-      auto newInst = hw::InstanceOp::create(
-          builder, modResult.module, inst.getInstanceNameAttr(), newOperands,
-          inst.getParameters(), inst.getInnerSymAttr());
-      newInst->setDialectAttrs(inst->getDialectAttrs());
-      if (inst.getDoNotPrintAttr())
-        newInst.setDoNotPrintAttr(inst.getDoNotPrintAttr());
+    if (auto resNames = inst.getResultNamesAttr()) {
+      SmallVector<Attribute> names;
+      for (auto [idx, attr] : llvm::enumerate(resNames))
+        if (!llvm::is_contained(modResult.removedOutputs, idx))
+          names.push_back(attr);
+      names.append(appendedResultNames.begin(), appendedResultNames.end());
+      newInst.setResultNamesAttr(ArrayAttr::get(inst.getContext(), names));
+    }
 
-      if (auto argNames = inst.getArgNamesAttr()) {
-        SmallVector<Attribute> names;
-        for (auto [idx, attr] : llvm::enumerate(argNames))
-          if (modResult.oldInputToNew[idx] != kInvalidIndex)
-            names.push_back(attr);
-        for (auto name : appendedOperandNames)
-          names.push_back(name);
-        newInst.setArgNamesAttr(ArrayAttr::get(inst.getContext(), names));
+    unsigned appendedCount = modResult.appendedOutputs.size();
+    if (appendedCount != 0) {
+      for (auto [relIdx, endpoint] :
+           llvm::enumerate(modResult.appendedOutputs)) {
+        unsigned resultIdx =
+            newInst.getNumResults() - appendedCount + relIdx;
+        recordOutput(endpoint, newInst.getResult(resultIdx));
       }
+    }
 
-      if (auto resNames = inst.getResultNamesAttr()) {
-        SmallVector<Attribute> names;
-        for (auto [idx, attr] : llvm::enumerate(resNames))
-          if (!llvm::is_contained(modResult.removedOutputs, idx))
-            names.push_back(attr);
-        for (auto name : appendedResultNames)
-          names.push_back(name);
-        newInst.setResultNamesAttr(ArrayAttr::get(inst.getContext(), names));
-      }
-      return newInst;
+    auto outputRemoved = [&](unsigned idx,
+                             ArrayRef<unsigned> removed) -> bool {
+      return llvm::is_contained(removed, idx);
     };
 
-    hw::InstanceOp combInst = info.combInstance;
-    hw::InstanceOp seqInst = info.seqInstance;
-    ModuleAggregationResult *combRes =
-        combIt != results.end() ? &combIt->second : nullptr;
-    ModuleAggregationResult *seqRes =
-        seqIt != results.end() ? &seqIt->second : nullptr;
-
-    OpBuilder edgeOpBuilder(topModule.getBodyBlock(),
-                            topModule.getBodyBlock()->begin());
-    BackedgeBuilder edgeBuilder(edgeOpBuilder, topModule.getLoc());
-    Backedge seqToCombEdge;
-    SmallVector<Value> combAppendedOperands;
-    SmallVector<StringAttr> combAppendedOperandNames;
-    SmallVector<StringAttr> combAppendedResultNames;
-
-    if (combRes) {
-      for (auto &port : combRes->appendedInputs) {
-        if (port.kind == BundleKind::SeqToComb) {
-          seqToCombEdge = edgeBuilder.get(port.type);
-          combAppendedOperands.push_back(seqToCombEdge);
-          combAppendedOperandNames.push_back(port.name);
-        }
+    for (auto [idx, mapIdx] : llvm::enumerate(modResult.oldOutputToNew)) {
+      if (outputRemoved(idx, modResult.removedOutputs)) {
+        inst.getResult(idx).dropAllUses();
+        continue;
       }
-      for (auto &port : combRes->appendedOutputs)
-        combAppendedResultNames.push_back(port.name);
+      assert(mapIdx != kInvalidIndex &&
+             "expected kept output to have valid mapping");
+      inst.getResult(idx).replaceAllUsesWith(newInst.getResult(mapIdx));
     }
+    inst.erase();
+  };
 
-    hw::InstanceOp newCombInst =
-        combRes ? rewriteInstance(combInst, *combRes, combAppendedOperands,
-                                  combAppendedOperandNames,
-                                  combAppendedResultNames)
-                : combInst;
-
-    Value combToSeqBundle;
-    if (combRes) {
-      unsigned appendedCount = combRes->appendedOutputs.size();
-      for (auto [relIdx, port] :
-           llvm::enumerate(combRes->appendedOutputs)) {
-        if (port.kind == BundleKind::CombToSeq) {
-          unsigned resultIdx =
-              newCombInst.getNumResults() - appendedCount + relIdx;
-          combToSeqBundle = newCombInst.getResult(resultIdx);
-          break;
-        }
-      }
-    }
-
-    SmallVector<Value> seqAppendedOperands;
-    SmallVector<StringAttr> seqAppendedOperandNames;
-    SmallVector<StringAttr> seqAppendedResultNames;
-    if (seqRes) {
-      for (auto &port : seqRes->appendedInputs) {
-        if (port.kind == BundleKind::CombToSeq) {
-          seqAppendedOperands.push_back(combToSeqBundle);
-          seqAppendedOperandNames.push_back(port.name);
-        }
-      }
-      for (auto &port : seqRes->appendedOutputs)
-        seqAppendedResultNames.push_back(port.name);
-    }
-
-    hw::InstanceOp newSeqInst =
-        seqRes ? rewriteInstance(seqInst, *seqRes, seqAppendedOperands,
-                                 seqAppendedOperandNames,
-                                 seqAppendedResultNames)
-               : seqInst;
-
-    if (seqRes) {
-      unsigned appendedCount = seqRes->appendedOutputs.size();
-      for (auto [relIdx, port] :
-           llvm::enumerate(seqRes->appendedOutputs)) {
-        if (port.kind == BundleKind::SeqToComb && seqToCombEdge) {
-          unsigned resultIdx =
-              newSeqInst.getNumResults() - appendedCount + relIdx;
-          seqToCombEdge.setValue(newSeqInst.getResult(resultIdx));
-          break;
-        }
-      }
-    }
-
-    if (seqRes) {
-      auto seqOutputRemoved = [&](unsigned idx) {
-        return llvm::is_contained(seqRes->removedOutputs, idx);
-      };
-      for (auto [idx, mapIdx] :
-           llvm::enumerate(seqRes->oldOutputToNew)) {
-        if (seqOutputRemoved(idx)) {
-          seqInst.getResult(idx).dropAllUses();
-          continue;
-        }
-        assert(mapIdx != kInvalidIndex &&
-               "expected kept seq output to have valid mapping");
-        seqInst.getResult(idx)
-            .replaceAllUsesWith(newSeqInst.getResult(mapIdx));
-      }
-      seqInst.erase();
-    }
-    if (combRes) {
-      auto combOutputRemoved = [&](unsigned idx) {
-        return llvm::is_contained(combRes->removedOutputs, idx);
-      };
-      for (auto [idx, mapIdx] :
-           llvm::enumerate(combRes->oldOutputToNew)) {
-        if (combOutputRemoved(idx)) {
-          combInst.getResult(idx).dropAllUses();
-          continue;
-        }
-        assert(mapIdx != kInvalidIndex &&
-               "expected kept comb output to have valid mapping");
-        combInst.getResult(idx)
-            .replaceAllUsesWith(newCombInst.getResult(mapIdx));
-      }
-      combInst.erase();
-    }
-
-    if (seqRes && seqToCombEdge)
-      if (failed(edgeBuilder.clearOrEmitError()))
-        return failure();
+  for (const Partition &part : partitions.partitions) {
+    if (auto it = results.find(part.combModule); it != results.end())
+      rewriteInstance(part.combInstance, it->second);
+    if (auto it = results.find(part.seqModule); it != results.end())
+      rewriteInstance(part.seqInstance, it->second);
   }
+
+  if (!pendingBundles.empty()) {
+    auto diag =
+        topModule.emitOpError("failed to wire all aggregated corvus bundles");
+    for (const auto &it : pendingBundles) {
+      const BundleKey &key = it.first;
+      diag.attachNote()
+          << "missing producer for "
+          << (key.kind == BundleKind::CombToSeq ? "comb->seq" : "seq->comb")
+          << " bundle between P" << key.combId << " and P" << key.seqId;
+    }
+    return failure();
+  }
+
+  if (failed(edgeBuilder.clearOrEmitError()))
+    return failure();
+
   return success();
 }

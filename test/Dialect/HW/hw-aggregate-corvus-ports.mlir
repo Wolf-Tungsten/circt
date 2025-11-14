@@ -33,24 +33,24 @@ module {
 
 // CHECK-LABEL: hw.module private @__corvus_seq_P0
 // CHECK-SAME: in %clk : i1
-// CHECK-SAME: in %__corvus_bundle_c2s_P0 : i8
+// CHECK-SAME: in %CP0_to_SP0 : i8
 // CHECK-SAME: out passthru : i1
-// CHECK-SAME: out __corvus_bundle_s2c_P0 : i6
-// CHECK: comb.extract %__corvus_bundle_c2s_P0 from 0
-// CHECK: comb.extract %__corvus_bundle_c2s_P0 from 3
+// CHECK-SAME: out SP0_to_CP0 : i6
+// CHECK: comb.extract %CP0_to_SP0 from 0
+// CHECK: comb.extract %CP0_to_SP0 from 3
 // CHECK: comb.concat
 
 // CHECK-LABEL: hw.module private @__corvus_comb_P0
 // CHECK-SAME: in %clk : i1
-// CHECK-SAME: in %__corvus_bundle_s2c_P0 : i6
+// CHECK-SAME: in %SP0_to_CP0 : i6
 // CHECK-SAME: out comb_top : i1
-// CHECK-SAME: out __corvus_bundle_c2s_P0 : i8
-// CHECK: comb.extract %__corvus_bundle_s2c_P0 from 0
-// CHECK: comb.extract %__corvus_bundle_s2c_P0 from 2
+// CHECK-SAME: out CP0_to_SP0 : i8
+// CHECK: comb.extract %SP0_to_CP0 from 0
+// CHECK: comb.extract %SP0_to_CP0 from 2
 // CHECK: comb.concat
 
 // CHECK-LABEL: hw.module @__corvus_top
 // CHECK: %[[COMB:.*]], %[[C2S_BUNDLE:.*]] = hw.instance "__comb" @__corvus_comb_P0
 // CHECK: %[[SEQ:.*]] = hw.instance "__seq" @__corvus_seq_P0
-// CHECK-SAME: __corvus_bundle_c2s_P0: %[[C2S_BUNDLE]]
+// CHECK-SAME: CP0_to_SP0: %[[C2S_BUNDLE]]
 // CHECK: hw.output %[[COMB]] : i1
