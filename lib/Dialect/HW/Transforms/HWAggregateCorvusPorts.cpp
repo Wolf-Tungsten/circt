@@ -1,4 +1,4 @@
-//===- HWAggregateCorvusPartitions.cpp - Bundle corvus partition IO -------===//
+//===- HWAggregateCorvusPorts.cpp - Bundle corvus partition IO -------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -34,7 +34,7 @@
 
 namespace circt {
 namespace hw {
-#define GEN_PASS_DEF_HWAGGREGATECORVUSPARTITIONS
+#define GEN_PASS_DEF_HWAGGREGATECORVUSPORTS
 #include "circt/Dialect/HW/Passes.h.inc"
 } // namespace hw
 } // namespace circt
@@ -213,9 +213,9 @@ static void eraseOperands(Operation *op, ArrayRef<unsigned> indices) {
     op->eraseOperand(idx);
 }
 
-struct HWAggregateCorvusPartitionsPass
-    : hw::impl::HWAggregateCorvusPartitionsBase<
-          HWAggregateCorvusPartitionsPass> {
+struct HWAggregateCorvusPortsPass
+    : hw::impl::HWAggregateCorvusPortsBase<
+          HWAggregateCorvusPortsPass> {
   using Base::Base;
 
   void runOnOperation() override;
@@ -242,7 +242,7 @@ private:
 
 } // namespace
 
-void HWAggregateCorvusPartitionsPass::runOnOperation() {
+void HWAggregateCorvusPortsPass::runOnOperation() {
   ModuleOp module = getOperation();
   SymbolTable symbolTable(module);
 
@@ -294,7 +294,7 @@ void HWAggregateCorvusPartitionsPass::runOnOperation() {
     signalPassFailure();
 }
 
-LogicalResult HWAggregateCorvusPartitionsPass::discoverPartitions(
+LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
     ModuleOp module, hw::HWModuleOp topModule,
     SmallVectorImpl<PartitionInfo> &partitions, SymbolTable &symbolTable) {
   (void)symbolTable;
@@ -387,7 +387,7 @@ LogicalResult HWAggregateCorvusPartitionsPass::discoverPartitions(
 }
 
 LogicalResult
-HWAggregateCorvusPartitionsPass::analyzeDirectSignals(PartitionInfo &info) {
+HWAggregateCorvusPortsPass::analyzeDirectSignals(PartitionInfo &info) {
   if (!info.combInstance || !info.seqInstance)
     return success();
 
@@ -442,7 +442,7 @@ HWAggregateCorvusPartitionsPass::analyzeDirectSignals(PartitionInfo &info) {
   return success();
 }
 
-LogicalResult HWAggregateCorvusPartitionsPass::rewriteModuleForPartition(
+LogicalResult HWAggregateCorvusPortsPass::rewriteModuleForPartition(
     PartitionInfo &info,
     DenseMap<hw::HWModuleOp, ModuleAggregationResult> &moduleResults) {
   auto tryRewrite = [&](hw::HWModuleOp module, bool isComb) -> LogicalResult {
@@ -538,7 +538,7 @@ LogicalResult HWAggregateCorvusPartitionsPass::rewriteModuleForPartition(
   return success();
 }
 
-LogicalResult HWAggregateCorvusPartitionsPass::rewriteModule(
+LogicalResult HWAggregateCorvusPortsPass::rewriteModule(
     hw::HWModuleOp module, std::optional<InputBundleSpec> inputSpec,
     std::optional<OutputBundleSpec> outputSpec, BundleKind inputKind,
     BundleKind outputKind, ModuleAggregationResult &result) {
@@ -608,7 +608,7 @@ LogicalResult HWAggregateCorvusPartitionsPass::rewriteModule(
   return success();
 }
 
-LogicalResult HWAggregateCorvusPartitionsPass::rewriteTopInstances(
+LogicalResult HWAggregateCorvusPortsPass::rewriteTopInstances(
     hw::HWModuleOp topModule, ArrayRef<PartitionInfo> partitions,
     DenseMap<hw::HWModuleOp, ModuleAggregationResult> &results) {
   for (const PartitionInfo &info : partitions) {

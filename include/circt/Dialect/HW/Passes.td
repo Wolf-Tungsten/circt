@@ -271,8 +271,8 @@ def HWFlattenCorvusTop : Pass<"hw-flatten-corvus-top", "mlir::ModuleOp"> {
   ];
 }
 
-def HWAggregateCorvusPartitions
-    : Pass<"hw-aggregate-corvus-partitions", "mlir::ModuleOp"> {
+def HWAggregateCorvusPorts
+    : Pass<"hw-aggregate-corvus-ports", "mlir::ModuleOp"> {
   let summary = "Bundle direct __corvus_seq_P*/__corvus_comb_P* connections";
   let description = [{
     This pass scans `__corvus_top` for partitioned `__corvus_seq_P*` and

@@ -1,4 +1,4 @@
-// RUN: circt-opt --hw-aggregate-corvus-partitions %s | FileCheck %s
+// RUN: circt-opt --hw-aggregate-corvus-ports %s | FileCheck %s
 
 module {
   hw.module private @__corvus_seq_P0(in %clk : i1, in %comb_next0 : i3,
