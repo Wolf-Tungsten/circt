@@ -1,4 +1,4 @@
-//===- HWFlattenCorvusTop.cpp - Inline __corvus_seq/__corvus_comb ---------===//
+//===- HWFlattenCorvusTop.cpp - Inline corvus_seq/corvus_comb ---------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,9 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass removes the `__corvus_seq`/`__corvus_comb` wrappers below
-// `__corvus_top` by inlining the partitioned `_P*` instances that they contain.
-// After the transformation, `__corvus_top` directly instantiates the partition
+// This pass removes the `corvus_seq`/`corvus_comb` wrappers below
+// `corvus_top` by inlining the partitioned `_P*` instances that they contain.
+// After the transformation, `corvus_top` directly instantiates the partition
 // clones and forwards their results using SSA values only.
 //
 //===----------------------------------------------------------------------===//

@@ -2,9 +2,9 @@
 
 This document captures the behaviour implemented in
 `lib/Dialect/HW/Transforms/HWFlattenCorvusTop.cpp`. The pass rewrites the
-`hw.module` specified by `--top-module-name` (default `__corvus_top`) by
+`hw.module` specified by `--top-module-name` (default `corvus_top`) by
 flattening any instances of the sequential and combinational wrapper modules
-(`__corvus_seq` and `__corvus_comb` by default). The goal is to remove the extra
+(`corvus_seq` and `corvus_comb` by default). The goal is to remove the extra
 hierarchy level that `HWPartitionModules` introduces so that the top module
 directly instantiates every partition clone.
 
@@ -16,7 +16,7 @@ directly instantiates every partition clone.
 - Inline the wrapper bodies *only* when they are instantiated inside the top
   module, leaving other uses untouched, and delete the wrappers once they
   become unused.
-- Preserve the original interface of `__corvus_top` while ensuring its body
+- Preserve the original interface of `corvus_top` while ensuring its body
   consists solely of `hw.instance` operations whose operands/results are wired
   via SSA.
 
@@ -26,7 +26,7 @@ directly instantiates every partition clone.
    configured names. If the top module is missing, the pass fails. Missing
    wrappers are silently ignored so the pass can run even when partitioning was
    skipped.
-2. For each wrapper (`__corvus_seq` and `__corvus_comb`):
+2. For each wrapper (`corvus_seq` and `corvus_comb`):
    - Gather all `hw.instance` operations inside the top module that reference
      the wrapper.
    - For every such instance, clone the wrapper body into the top module using
@@ -42,9 +42,9 @@ directly instantiates every partition clone.
 
 After the pass runs:
 
-- `__corvus_top` no longer instantiates `__corvus_seq` and `__corvus_comb`.
+- `corvus_top` no longer instantiates `corvus_seq` and `corvus_comb`.
   Instead it contains the `_P*` partition instances directly.
 - All inter-instance connections remain SSA wires; no extra `hw` ops (besides
   `hw.instance` and the final `hw.output`) are introduced.
 - Wrapper modules are removed entirely once they no longer have users, so the
-  IR only contains the `_P*` clones and the flattened `__corvus_top`.
+  IR only contains the `_P*` clones and the flattened `corvus_top`.

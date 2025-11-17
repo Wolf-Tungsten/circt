@@ -402,15 +402,15 @@ static LogicalResult rewriteWrapperModule(HWModuleOp wrapper,
 
   if (seqInputCount != combExtraOutputCount) {
     wrapper.emitOpError()
-        << "__corvus_seq expects " << seqInputCount
-        << " inputs but __corvus_comb produced " << combExtraOutputCount
+        << "corvus_seq expects " << seqInputCount
+        << " inputs but corvus_comb produced " << combExtraOutputCount
         << " bridge outputs";
     return failure();
   }
   if (seqOutputCount != combExtraInputCount) {
     wrapper.emitOpError()
-        << "__corvus_comb expects " << combExtraInputCount
-        << " bridge inputs but __corvus_seq produced " << seqOutputCount;
+        << "corvus_comb expects " << combExtraInputCount
+        << " bridge inputs but corvus_seq produced " << seqOutputCount;
     return failure();
   }
 
@@ -433,7 +433,7 @@ static LogicalResult rewriteWrapperModule(HWModuleOp wrapper,
 
   auto combInst = builder.create<hw::InstanceOp>(
       loc, combModule.getOperation(),
-      builder.getStringAttr("__corvus_comb_inst"), combInputs);
+      builder.getStringAttr("corvus_comb_inst"), combInputs);
 
   SmallVector<Value> seqInputs;
   seqInputs.reserve(seqInputCount);
@@ -442,7 +442,7 @@ static LogicalResult rewriteWrapperModule(HWModuleOp wrapper,
 
   auto seqInst = builder.create<hw::InstanceOp>(
       loc, seqModule.getOperation(),
-      builder.getStringAttr("__corvus_seq_inst"), seqInputs);
+      builder.getStringAttr("corvus_seq_inst"), seqInputs);
 
   for (unsigned i = 0; i < seqOutputCount; ++i)
     fromSeqEdges[i].setValue(seqInst.getResult(i));
@@ -469,7 +469,7 @@ struct HWSplitSeqCombPass
     MLIRContext *ctx = top.getContext();
 
     StringRef targetName =
-        moduleName.empty() ? "__corvus_top" : StringRef(moduleName);
+        moduleName.empty() ? "corvus_top" : StringRef(moduleName);
 
     SmallVector<HWModuleOp> matches;
     for (HWModuleOp mod : top.getOps<HWModuleOp>()) {
@@ -503,8 +503,8 @@ struct HWSplitSeqCombPass
       return success();
     };
 
-    if (failed(ensureSymbolFree("__corvus_seq")) ||
-        failed(ensureSymbolFree("__corvus_comb"))) {
+    if (failed(ensureSymbolFree("corvus_seq")) ||
+        failed(ensureSymbolFree("corvus_comb"))) {
       signalPassFailure();
       return;
     }
@@ -514,12 +514,12 @@ struct HWSplitSeqCombPass
 
     builder.setInsertionPointAfter(wrapper);
     auto seqModule = cast<HWModuleOp>(builder.clone(*wrapper));
-    seqModule.setSymNameAttr(builder.getStringAttr("__corvus_seq"));
+    seqModule.setSymNameAttr(builder.getStringAttr("corvus_seq"));
     seqModule.setPrivate();
 
     builder.setInsertionPointAfter(seqModule);
     auto combModule = cast<HWModuleOp>(builder.clone(*wrapper));
-    combModule.setSymNameAttr(builder.getStringAttr("__corvus_comb"));
+    combModule.setSymNameAttr(builder.getStringAttr("corvus_comb"));
     combModule.setPrivate();
 
     size_t combOrigInputs = combModule.getNumInputPorts();

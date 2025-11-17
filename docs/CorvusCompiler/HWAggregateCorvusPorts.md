@@ -2,8 +2,8 @@
 
 This document describes the behaviour implemented in
 `lib/Dialect/HW/Transforms/HWAggregateCorvusPorts.cpp`. The pass bundles the
-one-to-one connections that exist between `__corvus_comb_P*`/
-`__corvus_seq_P*` partitions instantiated by `__corvus_top`, regardless of
+one-to-one connections that exist between `corvus_comb_P*`/
+`corvus_seq_P*` partitions instantiated by `corvus_top`, regardless of
 whether the producer and consumer share the same partition ID. Instead of
 thousands of tiny single-bit ports, the pass creates an aggregate port per
 partition pair and direction, concatenates the producer signals, and extracts them
@@ -25,11 +25,11 @@ partition while the number of cross-partition wires drops significantly.
 
 ## Preconditions and Options
 
-- `--top-module-name` (default `"__corvus_top"`) identifies the module whose
+- `--top-module-name` (default `"corvus_top"`) identifies the module whose
   body contains the partition instances. The pass is a no-op if the option is
   empty or the module cannot be found.
 - `--comb-partition-prefix` and `--seq-partition-prefix` (defaults
-  `"__corvus_comb_P"`/`"__corvus_seq_P"`) describe how partition modules and
+  `"corvus_comb_P"`/`"corvus_seq_P"`) describe how partition modules and
   instances are named. Matching numeric suffixes define partition IDs.
 - Every partition ID must have both a combinational and a sequential module
   definition plus exactly one instance of each under the top module. Duplicate
@@ -92,7 +92,7 @@ partition while the number of cross-partition wires drops significantly.
 
 Every aggregated connection is identified by its source and destination
 partition IDs plus the source partition type. A bundle that carries signals
-from `__corvus_comb_Px` to `__corvus_seq_Py` is named `CPx_to_SPy`. The same
+from `corvus_comb_Px` to `corvus_seq_Py` is named `CPx_to_SPy`. The same
 label is used on both modules participating in that direction (the comb module
 exposes the bundle as an output, while the seq module consumes it as an input).
 The reverse direction uses the flipped name `SPy_to_CPx`. This scheme avoids
@@ -105,9 +105,9 @@ Run the pass either standalone or as part of the Corvus compiler pipeline:
 
 ```sh
 circt-opt corvus.mlir \
-  --hw-aggregate-corvus-ports=top-module-name=__corvus_top,
-                          seq-partition-prefix=__corvus_seq_P,
-                          comb-partition-prefix=__corvus_comb_P
+  --hw-aggregate-corvus-ports=top-module-name=corvus_top,
+                          seq-partition-prefix=corvus_seq_P,
+                          comb-partition-prefix=corvus_comb_P
 ```
 
 The lit test `test/Dialect/HW/hw-aggregate-corvus-ports.mlir` provides concrete

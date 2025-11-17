@@ -6,12 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass finds one-to-one connections between matching `__corvus_seq_P*`
-// and `__corvus_comb_P*` modules inside `__corvus_top` and aggregates them into
+// This pass finds one-to-one connections between matching `corvus_seq_P*`
+// and `corvus_comb_P*` modules inside `corvus_top` and aggregates them into
 // wide bundle ports. It reduces the number of tiny cross-partition ports by
 // concatenating the signals on the producer side and extracting them on the
 // consumer side. The resulting aggregated ports are appended to the module
-// interfaces and the `__corvus_top` instances are rewritten to keep the design
+// interfaces and the `corvus_top` instances are rewritten to keep the design
 // functionally equivalent.
 //
 //===----------------------------------------------------------------------===//
@@ -396,10 +396,10 @@ LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
     ModuleOp module, hw::HWModuleOp topModule,
     DiscoveredPartitions &partitions) {
   StringRef combPrefix = combPartitionPrefix.empty()
-                             ? "__corvus_comb_P"
+                             ? "corvus_comb_P"
                              : StringRef(combPartitionPrefix);
   StringRef seqPrefix = seqPartitionPrefix.empty()
-                            ? "__corvus_seq_P"
+                            ? "corvus_seq_P"
                             : StringRef(seqPartitionPrefix);
 
   DenseMap<unsigned, hw::HWModuleOp> combModules;
@@ -408,13 +408,13 @@ LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
     StringRef name = mod.getModuleName();
     if (auto combId = parsePartitionId(name, combPrefix)) {
       if (!combModules.try_emplace(*combId, mod).second)
-        return mod.emitOpError("duplicate __corvus_comb partition id ")
+        return mod.emitOpError("duplicate corvus_comb partition id ")
                << *combId;
       continue;
     }
     if (auto seqId = parsePartitionId(name, seqPrefix)) {
       if (!seqModules.try_emplace(*seqId, mod).second)
-        return mod.emitOpError("duplicate __corvus_seq partition id ")
+        return mod.emitOpError("duplicate corvus_seq partition id ")
                << *seqId;
     }
   }
@@ -428,13 +428,13 @@ LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
     StringRef target = inst.getReferencedModuleName();
     if (auto combId = parsePartitionId(target, combPrefix)) {
       if (!combInstances.try_emplace(*combId, inst).second)
-        return inst.emitOpError("duplicated __corvus_comb instance for id ")
+        return inst.emitOpError("duplicated corvus_comb instance for id ")
                << *combId;
       continue;
     }
     if (auto seqId = parsePartitionId(target, seqPrefix)) {
       if (!seqInstances.try_emplace(*seqId, inst).second)
-        return inst.emitOpError("duplicated __corvus_seq instance for id ")
+        return inst.emitOpError("duplicated corvus_seq instance for id ")
                << *seqId;
     }
   }
@@ -442,32 +442,32 @@ LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
   for (auto &it : combInstances)
     if (!combModules.contains(it.first))
       return it.second.emitOpError(
-          "referenced __corvus_comb module not found for partition id ")
+          "referenced corvus_comb module not found for partition id ")
              << it.first;
   for (auto &it : seqInstances)
     if (!seqModules.contains(it.first))
       return it.second.emitOpError(
-          "referenced __corvus_seq module not found for partition id ")
+          "referenced corvus_seq module not found for partition id ")
              << it.first;
 
   for (auto &it : combModules)
     if (!seqModules.contains(it.first))
       return it.second.emitOpError(
-                 "missing __corvus_seq module for partition id ")
+                 "missing corvus_seq module for partition id ")
              << it.first;
   for (auto &it : seqModules)
     if (!combModules.contains(it.first))
       return it.second.emitOpError(
-                 "missing __corvus_comb module for partition id ")
+                 "missing corvus_comb module for partition id ")
              << it.first;
 
   for (auto &it : combModules)
     if (!combInstances.contains(it.first))
-      return topModule.emitOpError("missing __corvus_comb instance for id ")
+      return topModule.emitOpError("missing corvus_comb instance for id ")
              << it.first;
   for (auto &it : seqModules)
     if (!seqInstances.contains(it.first))
-      return topModule.emitOpError("missing __corvus_seq instance for id ")
+      return topModule.emitOpError("missing corvus_seq instance for id ")
              << it.first;
 
   SmallVector<unsigned> ids;

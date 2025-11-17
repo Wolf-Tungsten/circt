@@ -7,9 +7,9 @@
 //
 // This pass splits the single public HW module (user_top) into three modules
 // tailored for the Corvus flow:
-//   * __corvus_top (private) retains user logic but surfaces every instance
+//   * corvus_top (private) retains user logic but surfaces every instance
 //     connection through explicit ports.
-//   * __corvus_external (private) contains only the extracted instances and the
+//   * corvus_external (private) contains only the extracted instances and the
 //     matching bridge ports.
 //   * The public wrapper reuses the original module name, instantiates the two
 //     private modules, wires the bridge ports, and preserves the original IO
@@ -139,39 +139,39 @@ void HWStripExternalModule::runOnOperation() {
   originalInputCount = userTop.getNumInputPorts();
   originalOutputCount = userTop.getNumOutputPorts();
 
-  if (failed(ensureSymbolFree("__corvus_top")) ||
-      failed(ensureSymbolFree("__corvus_external"))) {
+  if (failed(ensureSymbolFree("corvus_top")) ||
+      failed(ensureSymbolFree("corvus_external"))) {
     signalPassFailure();
     return;
   }
 
   OpBuilder moduleBuilder(mlirModuleOp.getBodyRegion());
   auto originalNameAttr = userTop.getModuleNameAttr();
-  auto corvusTopNameAttr = moduleBuilder.getStringAttr("__corvus_top");
+  auto corvusTopNameAttr = moduleBuilder.getStringAttr("corvus_top");
   auto corvusExternalNameAttr =
-      moduleBuilder.getStringAttr("__corvus_external");
+      moduleBuilder.getStringAttr("corvus_external");
 
   userTop.setSymNameAttr(corvusTopNameAttr);
   userTop.setPrivate();
-  userTop->setAttr("__corvus_top", moduleBuilder.getUnitAttr());
+  userTop->setAttr("corvus_top", moduleBuilder.getUnitAttr());
 
   moduleBuilder.setInsertionPointAfter(userTop);
 
   Operation *externalCloneOp = userTop.clone();
   auto corvusExternal = cast<hw::HWModuleOp>(externalCloneOp);
-  corvusExternal->removeAttr("__corvus_top");
+  corvusExternal->removeAttr("corvus_top");
   corvusExternal.setSymNameAttr(corvusExternalNameAttr);
   moduleBuilder.insert(corvusExternal);
 
   moduleBuilder.setInsertionPointAfter(corvusExternal);
   Operation *wrapperCloneOp = userTop.clone();
   auto corvusWrapper = cast<hw::HWModuleOp>(wrapperCloneOp);
-  corvusWrapper->removeAttr("__corvus_top");
+  corvusWrapper->removeAttr("corvus_top");
   corvusWrapper.setSymNameAttr(originalNameAttr);
   moduleBuilder.insert(corvusWrapper);
 
   corvusExternal.setPrivate();
-  corvusExternal->setAttr("__corvus_external", moduleBuilder.getUnitAttr());
+  corvusExternal->setAttr("corvus_external", moduleBuilder.getUnitAttr());
 
   corvusWrapper.setPublic();
 
@@ -641,7 +641,7 @@ HWStripExternalModule::rewriteCorvusWrapper(hw::HWModuleOp corvusWrapper,
 
   auto corvusTopInst = bodyBuilder.create<hw::InstanceOp>(
       loc, corvusTop.getOperation(),
-      bodyBuilder.getStringAttr("__corvus_top_inst"), corvusTopInputs);
+      bodyBuilder.getStringAttr("corvus_top_inst"), corvusTopInputs);
 
   SmallVector<Value> corvusExternalInputs;
   corvusExternalInputs.reserve(bridgeOperandPorts.size());
@@ -651,7 +651,7 @@ HWStripExternalModule::rewriteCorvusWrapper(hw::HWModuleOp corvusWrapper,
 
   auto corvusExternalInst = bodyBuilder.create<hw::InstanceOp>(
       loc, corvusExternal.getOperation(),
-      bodyBuilder.getStringAttr("__corvus_external_inst"),
+      bodyBuilder.getStringAttr("corvus_external_inst"),
       corvusExternalInputs);
 
   for (auto [idx, edge] : llvm::enumerate(bridgeBackedges))

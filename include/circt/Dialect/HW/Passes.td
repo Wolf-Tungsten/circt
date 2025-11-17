@@ -111,7 +111,7 @@ def HWStripExternalModule: Pass<"hw-strip-external-module", "mlir::ModuleOp"> {
   let summary = "Strip external module references";
   let description = [{
     This pass splits the single public `hw.module` into private implementation
-    modules `__corvus_top` and `__corvus_external`, plus a public wrapper that
+    modules `corvus_top` and `corvus_external`, plus a public wrapper that
     keeps the original module name while instantiating the two private modules.
   }];
 }
@@ -169,8 +169,8 @@ def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
     seq op results and replace uses, then erase seq ops. The original module is erased.
   }];
   let options = [
-    Option<"moduleName", "module-name", "std::string", "\"__corvus_top\"",
-      "Only split the hw.module whose name matches this string (default: __corvus_top)">
+    Option<"moduleName", "module-name", "std::string", "\"corvus_top\"",
+      "Only split the hw.module whose name matches this string (default: corvus_top)">
   ];
 }
 
@@ -253,30 +253,30 @@ def HWPartitionModules : Pass<"hw-partition-modules", "mlir::ModuleOp"> {
 }
 
 def HWFlattenCorvusTop : Pass<"hw-flatten-corvus-top", "mlir::ModuleOp"> {
-  let summary = "Inline __corvus_seq/__corvus_comb partition wrappers into __corvus_top";
+  let summary = "Inline corvus_seq/corvus_comb partition wrappers into corvus_top";
   let description = [{
-    This pass erases the intermediate `__corvus_seq` and `__corvus_comb`
-    wrappers instantiated by `__corvus_top` by cloning the partitioned `_P*`
-    instances they contain directly into `__corvus_top`. The top-level module
+    This pass erases the intermediate `corvus_seq` and `corvus_comb`
+    wrappers instantiated by `corvus_top` by cloning the partitioned `_P*`
+    instances they contain directly into `corvus_top`. The top-level module
     retains its original interface and afterwards only contains `hw.instance`
     operations that instantiate the partition clones.
   }];
   let options = [
-    Option<"topModuleName", "top-module-name", "std::string", "\"__corvus_top\"",
+    Option<"topModuleName", "top-module-name", "std::string", "\"corvus_top\"",
            "Name of the hw.module whose wrapper instances should be flattened">,
-    Option<"seqWrapperName", "seq-wrapper-name", "std::string", "\"__corvus_seq\"",
+    Option<"seqWrapperName", "seq-wrapper-name", "std::string", "\"corvus_seq\"",
            "Name of the sequential wrapper module to inline when instantiated under the top module">,
-    Option<"combWrapperName", "comb-wrapper-name", "std::string", "\"__corvus_comb\"",
+    Option<"combWrapperName", "comb-wrapper-name", "std::string", "\"corvus_comb\"",
            "Name of the combinational wrapper module to inline when instantiated under the top module">
   ];
 }
 
 def HWAggregateCorvusPorts
     : Pass<"hw-aggregate-corvus-ports", "mlir::ModuleOp"> {
-  let summary = "Bundle direct __corvus_seq_P*/__corvus_comb_P* connections";
+  let summary = "Bundle direct corvus_seq_P*/corvus_comb_P* connections";
   let description = [{
-    This pass scans `__corvus_top` for partitioned `__corvus_seq_P*` and
-    `__corvus_comb_P*` instances that exchange signals exclusively with their
+    This pass scans `corvus_top` for partitioned `corvus_seq_P*` and
+    `corvus_comb_P*` instances that exchange signals exclusively with their
     matching partition. Such one-to-one connections are replaced with a single
     aggregated bundle port per direction by concatenating the producer signals
     and extracting them inside the consumer. Instance operands and results are
@@ -285,13 +285,13 @@ def HWAggregateCorvusPorts
   }];
   let dependentDialects = ["comb::CombDialect"];
   let options = [
-    Option<"topModuleName", "top-module-name", "std::string", "\"__corvus_top\"",
+    Option<"topModuleName", "top-module-name", "std::string", "\"corvus_top\"",
            "Name of the hw.module that instantiates the partition clones">,
     Option<"seqPartitionPrefix", "seq-partition-prefix", "std::string",
-           "\"__corvus_seq_P\"",
+           "\"corvus_seq_P\"",
            "Prefix used to identify sequential partition module names">,
     Option<"combPartitionPrefix", "comb-partition-prefix", "std::string",
-           "\"__corvus_comb_P\"",
+           "\"corvus_comb_P\"",
            "Prefix used to identify combinational partition module names">
   ];
 }
