@@ -292,7 +292,9 @@ def HWAggregateCorvusPorts
            "Prefix used to identify sequential partition module names">,
     Option<"combPartitionPrefix", "comb-partition-prefix", "std::string",
            "\"corvus_comb_P\"",
-           "Prefix used to identify combinational partition module names">
+           "Prefix used to identify combinational partition module names">,
+    Option<"maxBundleBitWidth", "max-bundle-bitwidth", "unsigned", "1024",
+           "Maximum width in bits allowed for an aggregated bundle port before it is split">
   ];
 }
 
