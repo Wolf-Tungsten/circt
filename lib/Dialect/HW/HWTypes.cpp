@@ -15,6 +15,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
+#include "circt/Dialect/Seq/SeqTypes.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -140,6 +141,7 @@ int64_t circt::hw::getBitWidth(mlir::Type type) {
         return maxSize;
       })
       .Case<EnumType>([](EnumType e) { return e.getBitWidth(); })
+      .Case<seq::ClockType>([](seq::ClockType) { return 1; })
       .Case<TypeAliasType>(
           [](TypeAliasType t) { return getBitWidth(t.getCanonicalType()); })
       .Default([](Type) { return -1; });
