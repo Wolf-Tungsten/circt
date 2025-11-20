@@ -155,7 +155,7 @@ public:
   }
 
   bool isSinkOp(Operation *op) const {
-    return isa<seq::FirRegOp, seq::FirMemOp>(op);
+    return isa<seq::FirRegOp, seq::FirMemOp, hw::OutputOp>(op);
   }
 
   bool isSinkID(NodeID id) const { return isSinkOp(idToOp[id]); }
@@ -166,9 +166,7 @@ public:
 
   bool isUpperBoundID(NodeID id) const { return isUpperBoundOp(idToOp[id]); }
 
-  bool isIgnoreOp(Operation *op) const {
-    return llvm::isa<hw::OutputOp>(op) || llvm::isa<hw::HWModuleOp>(op);
-  }
+  bool isIgnoreOp(Operation *op) const { return llvm::isa<hw::HWModuleOp>(op); }
 
   bool isSinkNode(NodeID id) const {
     return outNeigh[id].empty() || isSinkID(id);

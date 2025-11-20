@@ -325,6 +325,14 @@ static LogicalResult transformCombinationalModule(HWModuleOp combModule,
       memOps.push_back(op);
   });
 
+  // Remember the number of original outputs before we append bridge signals.
+  if (auto outputOp =
+          dyn_cast<hw::OutputOp>(combModule.getBodyBlock()->getTerminator())) {
+    auto attr = IntegerAttr::get(IntegerType::get(combModule.getContext(), 64),
+                                 cOrigOutputs);
+    outputOp->setAttr("hw.orig_output_count", attr);
+  }
+
   llvm::StringSet<> usedOutputNames;
   llvm::StringSet<> usedInputNames;
   SmallVector<std::pair<StringAttr, Value>> cOutputs;

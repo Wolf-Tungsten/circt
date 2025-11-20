@@ -190,9 +190,19 @@ struct HWPartitionModulesPass
       Block *body = clonedModule.getBodyBlock();
       auto outputOp = cast<hw::OutputOp>(body->getTerminator());
 
+      auto origCountAttr =
+          outputOp->getAttrOfType<IntegerAttr>("hw.orig_output_count");
+      unsigned origOutputCount = origCountAttr ? origCountAttr.getInt() : 0;
+      auto outputPartitionIds = getPartitionIds(outputOp);
+      bool dropOriginalOutputs = origCountAttr && !outputPartitionIds.empty() &&
+                                 !outputPartitionIds.contains(partitionId);
+
       SmallVector<Value> validOutputs;
       SmallVector<unsigned> outputsToKeep;
       for (unsigned i = 0; i < outputOp.getNumOperands(); i++) {
+        if (dropOriginalOutputs && i < origOutputCount)
+          continue;
+
         Value outputValue = outputOp.getOperand(i);
         Operation *defOp = outputValue.getDefiningOp();
 
