@@ -159,6 +159,22 @@ def HWInsertWires : Pass<"hw-insert-wires", "hw::HWModuleOp"> {
   ];
 }
 
+def HWInsertPartitionWires : Pass<"hw-insert-partition-wires", "hw::HWModuleOp"> {
+  let summary = "Insert wires for seq boundary operands grouped by partition";
+  let description = [{
+    This pass inserts hw.wire operations between operations that drive
+    seq boundary ops (FirReg/FirMem*/Output). For every operand of such an op,
+    the pass looks at the op's hw.repcut_partitions attribute and ensures there
+    is exactly one wire between the defining operation and the boundary op per
+    (defining operation, partition set) combination. This preserves distinct
+    SSA edges for later per-partition cloning.
+  }];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "",
+           "Only run on hw.module operations whose name matches this string">
+  ];
+}
+
 def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
   let summary = "Split flattened module into sequential S and combinational C modules";
   let description = [{

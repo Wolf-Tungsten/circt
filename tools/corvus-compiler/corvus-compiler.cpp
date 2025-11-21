@@ -724,6 +724,9 @@ LogicalResult processBuffer(
     repcutOptions.numPartitions =
         corvusCompilerOptions.getRepCutNumPartitions();
     hwModulePM.addPass(hw::createHWRepCut(repcutOptions));
+    hw::HWInsertPartitionWiresOptions partitionWireOptions;
+    partitionWireOptions.moduleName = "__corvus_top";
+    hwModulePM.addPass(hw::createHWInsertPartitionWires(partitionWireOptions));
     pm.addPass(hw::createHWSplitSeqComb());
     hw::HWPartitionModulesOptions seqPartitionOptions;
     seqPartitionOptions.moduleName = "__corvus_seq";
