@@ -717,23 +717,33 @@ LogicalResult processBuffer(
         hw::createHWReduceMemReadLatency(hw::HWReduceMemReadLatencyOptions{1}));
     auto &hwModulePM = pm.nest<hw::HWModuleOp>();
     hw::HWInsertWiresOptions insertWiresOptions;
-    insertWiresOptions.moduleName = "__corvus_top";
+    insertWiresOptions.moduleName = "corvus_top";
     hwModulePM.addPass(hw::createHWInsertWires(insertWiresOptions));
     hw::HWRepCutOptions repcutOptions;
-    repcutOptions.moduleName = "__corvus_top";
+    repcutOptions.moduleName = "corvus_top";
     repcutOptions.numPartitions =
         corvusCompilerOptions.getRepCutNumPartitions();
     hwModulePM.addPass(hw::createHWRepCut(repcutOptions));
     hw::HWInsertPartitionWiresOptions partitionWireOptions;
-    partitionWireOptions.moduleName = "__corvus_top";
+    partitionWireOptions.moduleName = "corvus_top";
     hwModulePM.addPass(hw::createHWInsertPartitionWires(partitionWireOptions));
     pm.addPass(hw::createHWSplitSeqComb());
     hw::HWPartitionModulesOptions seqPartitionOptions;
-    seqPartitionOptions.moduleName = "__corvus_seq";
+    seqPartitionOptions.moduleName = "corvus_seq";
     pm.addPass(hw::createHWPartitionModules(seqPartitionOptions));
     hw::HWPartitionModulesOptions combPartitionOptions;
-    combPartitionOptions.moduleName = "__corvus_comb";
+    combPartitionOptions.moduleName = "corvus_comb";
     pm.addPass(hw::createHWPartitionModules(combPartitionOptions));
+    hw::HWFlattenCorvusTopOptions flattenOptions;
+    flattenOptions.topModuleName = "corvus_top";
+    flattenOptions.seqWrapperName = "corvus_seq";
+    flattenOptions.combWrapperName = "corvus_comb";
+    pm.addPass(hw::createHWFlattenCorvusTop(flattenOptions));
+    hw::HWAggregateCorvusPortsOptions aggregateOptions;
+    aggregateOptions.topModuleName = "corvus_top";
+    aggregateOptions.seqPartitionPrefix = "corvus_seq_P";
+    aggregateOptions.combPartitionPrefix = "corvus_comb_P";
+    pm.addPass(hw::createHWAggregateCorvusPorts(aggregateOptions));
   }
   // Corvus Compiler Pass End
 

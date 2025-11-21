@@ -16,6 +16,8 @@ add_circt_dialect_library(CIRCTHWTransforms
   HWInsertWires.cpp
   HWInsertPartitionWires.cpp
   HWSplitSeqComb.cpp
+  HWAggregateCorvusPorts.cpp
+  HWFlattenCorvusTop.cpp
   HWFixXMRRef.cpp
   HWGlobalUniqueInnerSym.cpp
   HWCombmemToReg.cpp
