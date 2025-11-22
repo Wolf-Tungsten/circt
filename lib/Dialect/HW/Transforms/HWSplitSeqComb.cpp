@@ -31,6 +31,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include <optional>
 #include <numeric>
 #include <cctype>
 
@@ -56,6 +57,25 @@ static bool isSeqBoundaryOp(Operation *op) {
 }
 
 static bool isConst(Value v) { return v.getDefiningOp<hw::ConstantOp>(); }
+
+static std::optional<uint64_t> getSeqPartitionId(Operation *op) {
+  auto attr = op->getAttrOfType<ArrayAttr>("hw.repcut_partitions");
+  if (!attr)
+    return std::nullopt;
+
+  SmallVector<uint64_t, 4> ids;
+  ids.reserve(attr.size());
+  for (Attribute elem : attr)
+    if (auto intAttr = dyn_cast<IntegerAttr>(elem))
+      ids.push_back(intAttr.getUInt());
+
+  if (ids.empty())
+    return std::nullopt;
+
+  llvm::sort(ids);
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  return ids.front();
+}
 
 static std::string sanitizePortComponent(StringRef raw) {
   std::string result;
@@ -205,6 +225,21 @@ static std::string getSeqResultPortName(Operation *op, unsigned resultIndex) {
   return "";
 }
 
+static std::string addPartitionDirectionSuffix(Operation *seqOp,
+                                               StringRef baseName,
+                                               StringRef directionTag) {
+  auto partitionId = getSeqPartitionId(seqOp);
+  if (!partitionId)
+    return baseName.str();
+
+  std::string name = baseName.str();
+  if (!name.empty())
+    name.push_back('_');
+  name += directionTag;
+  name += std::to_string(*partitionId);
+  return name;
+}
+
 static size_t
 collectUniqueInput(DenseMap<Value, size_t> &map,
                    SmallVector<std::pair<StringAttr, Type>> &inputs, Value v,
@@ -270,18 +305,24 @@ static LogicalResult transformSequentialModule(HWModuleOp seqModule) {
       Value v = operand.get();
       if (isConst(v) || v.getDefiningOp<seq::FirMemOp>())
         continue;
-      std::string desiredName = getSeqOperandPortName(&op, operand);
+      std::string desiredName =
+          addPartitionDirectionSuffix(&op, getSeqOperandPortName(&op, operand),
+                                      "to_S");
+      std::string fallbackName =
+          addPartitionDirectionSuffix(&op, "seq_in", "to_S");
       size_t idx =
           collectUniqueInput(valToInputIdx, sInputs, v, usedInputNames,
-                             seqModule.getContext(), desiredName, "seq_in");
+                             seqModule.getContext(), desiredName, fallbackName);
       operandsToReplace.push_back({&operand, idx});
     }
 
     unsigned resultIndex = 0;
     for (Value res : op.getResults())
-      collectUniqueOutput(exported, sOutputs, res, usedOutputNames,
-                          seqModule.getContext(),
-                          getSeqResultPortName(&op, resultIndex++), "seq_out");
+      collectUniqueOutput(
+          exported, sOutputs, res, usedOutputNames, seqModule.getContext(),
+          addPartitionDirectionSuffix(
+              &op, getSeqResultPortName(&op, resultIndex++), "from_S"),
+          addPartitionDirectionSuffix(&op, "seq_out", "from_S"));
   }
 
   if (!sInputs.empty()) {
@@ -343,7 +384,9 @@ static LogicalResult transformCombinationalModule(HWModuleOp combModule,
         continue;
       collectUniqueOutput(cOutAdded, cOutputs, v, usedOutputNames,
                           combModule.getContext(),
-                          getSeqOperandPortName(op, operand), "to_s");
+                          addPartitionDirectionSuffix(
+                              op, getSeqOperandPortName(op, operand), "to_S"),
+                          addPartitionDirectionSuffix(op, "to_s", "to_S"));
     }
 
   if (!cOutputs.empty())
@@ -358,7 +401,10 @@ static LogicalResult transformCombinationalModule(HWModuleOp combModule,
       bool inserted = false;
       collectUniqueInput(cValueToInputIdx, cInputs, res, usedInputNames,
                          combModule.getContext(),
-                         getSeqResultPortName(op, resultIndex++), "from_s",
+                         addPartitionDirectionSuffix(
+                             op, getSeqResultPortName(op, resultIndex++),
+                             "from_S"),
+                         addPartitionDirectionSuffix(op, "from_s", "from_S"),
                          &inserted);
       if (inserted)
         valuesToReplace.push_back(res);
