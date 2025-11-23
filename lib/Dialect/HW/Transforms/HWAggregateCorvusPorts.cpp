@@ -790,6 +790,7 @@ HWAggregateCorvusPortsPass::rewriteModule(hw::HWModuleOp module,
 
   if (!plan.inputs.empty()) {
     builder.setInsertionPointToStart(body);
+    unsigned wireCounter = 0;
     for (const auto &spec : plan.inputs) {
       auto inserted =
           module.insertInputs(module.getNumInputPorts(),
@@ -797,26 +798,49 @@ HWAggregateCorvusPortsPass::rewriteModule(hw::HWModuleOp module,
       Value aggregate = inserted.front().second;
       StringAttr actualName = inserted.front().first;
 
-      SmallVector<Value> extracted(spec.bundle->signals.size());
+      SmallVector<int64_t> offsets;
+      offsets.reserve(spec.bundle->signals.size());
       int64_t offset = 0;
-      for (auto [sigIdx, signal] : llvm::enumerate(spec.bundle->signals)) {
-        auto sliceOr = extractSlice(module.getLoc(), builder, aggregate,
-                                    signal.type, offset);
-        if (failed(sliceOr))
-          return failure();
+      for (const auto &signal : spec.bundle->signals) {
+        offsets.push_back(offset);
         auto widthOr = getSignalBitWidth(module.getLoc(), signal.type);
         if (failed(widthOr))
           return failure();
-        auto wire = builder.create<hw::WireOp>(module.getLoc(), *sliceOr);
-        extracted[sigIdx] = wire.getResult();
         offset += *widthOr;
       }
 
-      for (auto [sigIdx, ports] :
-           llvm::enumerate(spec.signalInputPorts)) {
+      SmallVector<Value> extracted(spec.bundle->signals.size());
+      auto getWire = [&](unsigned sigIdx) -> FailureOr<Value> {
+        if (extracted[sigIdx])
+          return extracted[sigIdx];
+        auto sliceOr = extractSlice(module.getLoc(), builder, aggregate,
+                                    spec.bundle->signals[sigIdx].type,
+                                    offsets[sigIdx]);
+        if (failed(sliceOr))
+          return failure();
+        std::string wireName =
+            (spec.bundle->name.getValue() + "_slice" + std::to_string(sigIdx))
+                .str();
+        std::string symName =
+            wireName + "_sym" + std::to_string(wireCounter++);
+        auto wire = builder
+                        .create<hw::WireOp>(
+                            module.getLoc(), *sliceOr,
+                            builder.getStringAttr(wireName),
+                            hw::InnerSymAttr::get(
+                                builder.getStringAttr(symName)))
+                        .getResult();
+        extracted[sigIdx] = wire;
+        return wire;
+      };
+
+      for (auto [sigIdx, ports] : llvm::enumerate(spec.signalInputPorts)) {
+        auto wireOr = getWire(sigIdx);
+        if (failed(wireOr))
+          return failure();
         for (unsigned portIdx : ports) {
           BlockArgument arg = body->getArgument(portIdx);
-          arg.replaceAllUsesWith(extracted[sigIdx]);
+          arg.replaceAllUsesWith(*wireOr);
           inputsToErase.push_back(portIdx);
         }
       }
