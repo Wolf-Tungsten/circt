@@ -31,6 +31,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Debug.h"
 #include <optional>
 #include <numeric>
 #include <cctype>
@@ -317,12 +318,17 @@ static LogicalResult transformSequentialModule(HWModuleOp seqModule) {
     }
 
     unsigned resultIndex = 0;
-    for (Value res : op.getResults())
+    for (Value res : op.getResults()) {
+      if (res.use_empty()) {
+        ++resultIndex;
+        continue;
+      }
       collectUniqueOutput(
           exported, sOutputs, res, usedOutputNames, seqModule.getContext(),
           addPartitionDirectionSuffix(
               &op, getSeqResultPortName(&op, resultIndex++), "from_S"),
           addPartitionDirectionSuffix(&op, "seq_out", "from_S"));
+    }
   }
 
   if (!sInputs.empty()) {
@@ -398,6 +404,10 @@ static LogicalResult transformCombinationalModule(HWModuleOp combModule,
   for (Operation *op : seqOps) {
     unsigned resultIndex = 0;
     for (Value res : op->getResults()) {
+      if (res.use_empty()) {
+        ++resultIndex;
+        continue;
+      }
       bool inserted = false;
       collectUniqueInput(cValueToInputIdx, cInputs, res, usedInputNames,
                          combModule.getContext(),
