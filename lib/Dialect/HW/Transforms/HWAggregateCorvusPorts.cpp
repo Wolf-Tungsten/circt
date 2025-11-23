@@ -6,13 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass finds one-to-one connections between matching `corvus_seq_P*`
-// and `corvus_comb_P*` modules inside `corvus_top` and aggregates them into
-// wide bundle ports. It reduces the number of tiny cross-partition ports by
-// concatenating the signals on the producer side and extracting them on the
-// consumer side. The resulting aggregated ports are appended to the module
-// interfaces and the `corvus_top` instances are rewritten to keep the design
-// functionally equivalent.
+// This pass aggregates the direct connections between `corvus_seq_P*` and
+// `corvus_comb_P*` partitions instantiated under `corvus_top`. Instead of
+// only bundling one-to-one edges, it now groups all signals that flow from a
+// partition to a *set* of opposite-kind partitions. Each group becomes a
+// single bundle port on the producer that is fanned out to every consumer in
+// the set. The producer concatenates the bundled signals while each consumer
+// immediately extracts them into wires, keeping partition IO compact without
+// changing behaviour.
 //
 //===----------------------------------------------------------------------===//
 
@@ -81,56 +82,48 @@ struct DiscoveredPartitions {
   DenseMap<Operation *, unsigned> seqInstanceToId;
 };
 
-struct PartitionPairKey {
-  unsigned combId = 0;
-  unsigned seqId = 0;
+enum class PartitionKind { Comb, Seq };
 
-  bool operator==(const PartitionPairKey &rhs) const {
-    return combId == rhs.combId && seqId == rhs.seqId;
-  }
+struct DestPortInfo {
+  unsigned destId = 0;
+  SmallVector<unsigned> inputPorts;
 };
 
-struct PartitionPairInfo {
-  PartitionPairKey key;
-  SmallVector<CombToSeqSignal> combToSeq;
-  SmallVector<SeqToCombSignal> seqToComb;
-  StringAttr combToSeqBundleName;
-  StringAttr seqToCombBundleName;
+struct BundleSignal {
+  unsigned sourcePortIdx = 0;
+  Type type;
+  SmallVector<DestPortInfo> consumers;
 };
 
-struct BundleEndpoint {
-  BundleKind kind;
-  unsigned combId = 0;
-  unsigned seqId = 0;
+struct BundleInfo {
+  BundleKind kind = BundleKind::CombToSeq;
+  unsigned sourceId = 0;
+  SmallVector<unsigned> destIds;
+  SmallVector<BundleSignal> signals;
   StringAttr name;
+  LocationAttr loc;
   Type type;
 };
 
-struct BundleChunkSpec {
-  SmallVector<unsigned> producerPorts;
-  SmallVector<unsigned> consumerPorts;
-  SmallVector<Type> elementTypes;
-};
-
-struct InputBundleSpec {
-  BundleEndpoint endpoint;
-  SmallVector<unsigned> portIndices;
-};
-
-struct OutputBundleSpec {
-  BundleEndpoint endpoint;
-  SmallVector<unsigned> portIndices;
-};
-
 struct ModuleBundlePlan {
-  SmallVector<InputBundleSpec> inputs;
-  SmallVector<OutputBundleSpec> outputs;
+  struct InputBundle {
+    const BundleInfo *bundle = nullptr;
+    SmallVector<SmallVector<unsigned>> signalInputPorts;
+  };
+
+  struct OutputBundle {
+    const BundleInfo *bundle = nullptr;
+    SmallVector<unsigned> signalOutputPorts;
+  };
+
+  SmallVector<InputBundle> inputs;
+  SmallVector<OutputBundle> outputs;
 };
 
 struct AppendedPortInfo {
-  BundleKind kind;
-  unsigned combId = 0;
-  unsigned seqId = 0;
+  BundleKind kind = BundleKind::CombToSeq;
+  unsigned sourceId = 0;
+  SmallVector<unsigned> destIds;
   StringAttr name;
   Type type;
   StringAttr bundleName;
@@ -148,14 +141,27 @@ struct ModuleAggregationResult {
   SmallVector<AppendedPortInfo> appendedOutputs;
 };
 
+struct BundleGroupKey {
+  BundleKind kind = BundleKind::CombToSeq;
+  unsigned sourceId = 0;
+  SmallVector<unsigned> destIds;
+
+  bool operator==(const BundleGroupKey &rhs) const {
+    return kind == rhs.kind && sourceId == rhs.sourceId &&
+           destIds == rhs.destIds;
+  }
+};
+
 static StringAttr makeBundleName(MLIRContext *ctx, BundleKind kind,
-                                 unsigned combId, unsigned seqId) {
+                                 unsigned sourceId, ArrayRef<unsigned> destIds) {
   std::string buffer;
   llvm::raw_string_ostream os(buffer);
   if (kind == BundleKind::CombToSeq)
-    os << "CP" << combId << "_to_SP" << seqId;
+    os << "C" << sourceId << "_to_S";
   else
-    os << "SP" << seqId << "_to_CP" << combId;
+    os << "S" << sourceId << "_to_C";
+  llvm::interleave(destIds, os, "_");
+  os << "_bundle";
   return StringAttr::get(ctx, os.str());
 }
 
@@ -207,14 +213,14 @@ static const Partition &getPartition(const DiscoveredPartitions &parts,
 }
 
 struct BundleKey {
-  unsigned combId = 0;
-  unsigned seqId = 0;
   BundleKind kind = BundleKind::CombToSeq;
+  unsigned sourceId = 0;
+  SmallVector<unsigned> destIds;
   StringAttr bundleName;
 
   bool operator==(const BundleKey &rhs) const {
-    return combId == rhs.combId && seqId == rhs.seqId && kind == rhs.kind &&
-           bundleName == rhs.bundleName;
+    return kind == rhs.kind && sourceId == rhs.sourceId &&
+           destIds == rhs.destIds && bundleName == rhs.bundleName;
   }
 };
 
@@ -222,16 +228,19 @@ struct BundleKey {
 
 namespace llvm {
 template <>
-struct DenseMapInfo<PartitionPairKey> {
-  static inline PartitionPairKey getEmptyKey() { return {~0u, ~0u}; }
-  static inline PartitionPairKey getTombstoneKey() {
-    return {~0u - 1, ~0u - 1};
+struct DenseMapInfo<BundleGroupKey> {
+  static inline BundleGroupKey getEmptyKey() {
+    return {BundleKind::CombToSeq, ~0u, SmallVector<unsigned>()};
   }
-  static unsigned getHashValue(const PartitionPairKey &key) {
-    return hash_combine(key.combId, key.seqId);
+  static inline BundleGroupKey getTombstoneKey() {
+    return {BundleKind::CombToSeq, ~0u - 1, SmallVector<unsigned>()};
   }
-  static bool isEqual(const PartitionPairKey &lhs,
-                      const PartitionPairKey &rhs) {
+  static unsigned getHashValue(const BundleGroupKey &key) {
+    return hash_combine(static_cast<unsigned>(key.kind), key.sourceId,
+                        hash_combine_range(key.destIds.begin(),
+                                           key.destIds.end()));
+  }
+  static bool isEqual(const BundleGroupKey &lhs, const BundleGroupKey &rhs) {
     return lhs == rhs;
   }
 };
@@ -239,13 +248,16 @@ struct DenseMapInfo<PartitionPairKey> {
 template <>
 struct DenseMapInfo<BundleKey> {
   static inline BundleKey getEmptyKey() {
-    return {~0u, ~0u, BundleKind::CombToSeq, StringAttr()};
+    return {BundleKind::CombToSeq, ~0u, SmallVector<unsigned>(), StringAttr()};
   }
   static inline BundleKey getTombstoneKey() {
-    return {~0u - 1, ~0u - 1, BundleKind::CombToSeq, StringAttr()};
+    return {BundleKind::CombToSeq, ~0u - 1, SmallVector<unsigned>(),
+            StringAttr()};
   }
   static unsigned getHashValue(const BundleKey &key) {
-    return hash_combine(key.combId, key.seqId, static_cast<unsigned>(key.kind),
+    return hash_combine(static_cast<unsigned>(key.kind), key.sourceId,
+                        hash_combine_range(key.destIds.begin(),
+                                           key.destIds.end()),
                         key.bundleName);
   }
   static bool isEqual(const BundleKey &lhs, const BundleKey &rhs) {
@@ -280,7 +292,7 @@ static FailureOr<Type> buildBundleType(Location loc, ArrayRef<Type> types,
   }
   if (totalWidth <= 0)
     return emitError(loc) << "bundle width must be greater than zero";
-  if (totalWidth > std::numeric_limits<int32_t>::max())
+  if (totalWidth > IntegerType::kMaxWidth)
     return emitError(loc) << "bundle width " << totalWidth
                           << " exceeds supported limit";
   return builder.getIntegerType(static_cast<unsigned>(totalWidth));
@@ -302,44 +314,6 @@ computeOldToNewMapping(unsigned oldCount, ArrayRef<unsigned> removed) {
     }
   }
   return mapping;
-}
-
-template <typename SignalT, typename ProducerGetter, typename ConsumerGetter>
-static LogicalResult buildBundleChunks(
-    ArrayRef<SignalT> signals, bool enforceLimit, int64_t widthLimit,
-    Location loc, ProducerGetter &&getProducerIdx,
-    ConsumerGetter &&getConsumerIdx, SmallVectorImpl<BundleChunkSpec> &chunks) {
-  chunks.clear();
-  if (signals.empty())
-    return success();
-
-  BundleChunkSpec current;
-  int64_t currentWidth = 0;
-  auto flush = [&]() {
-    if (current.elementTypes.empty())
-      return;
-    chunks.push_back(std::move(current));
-    current = BundleChunkSpec();
-    currentWidth = 0;
-  };
-
-  for (const auto &signal : signals) {
-    auto widthOr = getSignalBitWidth(loc, signal.type);
-    if (failed(widthOr))
-      return failure();
-    int64_t width = *widthOr;
-    if (enforceLimit && currentWidth != 0 && currentWidth + width > widthLimit)
-      flush();
-    current.producerPorts.push_back(getProducerIdx(signal));
-    current.consumerPorts.push_back(getConsumerIdx(signal));
-    current.elementTypes.push_back(signal.type);
-    currentWidth += width;
-    if (enforceLimit && currentWidth >= widthLimit)
-      flush();
-  }
-
-  flush();
-  return success();
 }
 
 static FailureOr<Value> packValues(Location loc, OpBuilder &builder,
@@ -406,12 +380,11 @@ struct HWAggregateCorvusPortsPass
 private:
   LogicalResult discoverPartitions(ModuleOp module, hw::HWModuleOp topModule,
                                    DiscoveredPartitions &partitions);
-  LogicalResult
-  collectPartitionPairs(const DiscoveredPartitions &partitions,
-                        SmallVectorImpl<PartitionPairInfo> &pairs);
+  LogicalResult collectBundles(const DiscoveredPartitions &partitions,
+                               SmallVectorImpl<BundleInfo> &bundles);
   LogicalResult
   buildModulePlans(const DiscoveredPartitions &partitions,
-                   ArrayRef<PartitionPairInfo> pairs,
+                   ArrayRef<BundleInfo> bundles,
                    DenseMap<hw::HWModuleOp, ModuleBundlePlan> &plans);
   LogicalResult rewriteModule(hw::HWModuleOp module,
                               const ModuleBundlePlan &plan,
@@ -444,16 +417,16 @@ void HWAggregateCorvusPortsPass::runOnOperation() {
   if (partitions.partitions.empty())
     return;
 
-  SmallVector<PartitionPairInfo> pairs;
-  if (failed(collectPartitionPairs(partitions, pairs))) {
+  SmallVector<BundleInfo> bundles;
+  if (failed(collectBundles(partitions, bundles))) {
     signalPassFailure();
     return;
   }
-  if (pairs.empty())
+  if (bundles.empty())
     return;
 
   DenseMap<hw::HWModuleOp, ModuleBundlePlan> plans;
-  if (failed(buildModulePlans(partitions, pairs, plans))) {
+  if (failed(buildModulePlans(partitions, bundles, plans))) {
     signalPassFailure();
     return;
   }
@@ -575,212 +548,192 @@ LogicalResult HWAggregateCorvusPortsPass::discoverPartitions(
   return success();
 }
 
-LogicalResult HWAggregateCorvusPortsPass::collectPartitionPairs(
+LogicalResult HWAggregateCorvusPortsPass::collectBundles(
     const DiscoveredPartitions &partitions,
-    SmallVectorImpl<PartitionPairInfo> &pairs) {
-  pairs.clear();
+    SmallVectorImpl<BundleInfo> &bundles) {
+  bundles.clear();
   if (partitions.partitions.empty())
     return success();
 
   hw::HWModuleOp sampleModule = partitions.partitions.front().combModule;
   MLIRContext *ctx = sampleModule.getContext();
-  DenseMap<PartitionPairKey, PartitionPairInfo> pairMap;
+  DenseMap<BundleGroupKey, BundleInfo> bundleMap;
 
-  auto getPair = [&](unsigned combId, unsigned seqId) -> PartitionPairInfo & {
-    PartitionPairKey key{combId, seqId};
-    auto [it, inserted] = pairMap.try_emplace(key);
-    if (inserted) {
-      it->second.key = key;
-      it->second.combToSeqBundleName =
-          makeBundleName(ctx, BundleKind::CombToSeq, combId, seqId);
-      it->second.seqToCombBundleName =
-          makeBundleName(ctx, BundleKind::SeqToComb, combId, seqId);
+  auto classifyInstance = [&](Operation *op)
+      -> std::optional<std::pair<PartitionKind, unsigned>> {
+    if (auto it = partitions.combInstanceToId.find(op);
+        it != partitions.combInstanceToId.end())
+      return std::make_pair(PartitionKind::Comb, it->second);
+    if (auto it = partitions.seqInstanceToId.find(op);
+        it != partitions.seqInstanceToId.end())
+      return std::make_pair(PartitionKind::Seq, it->second);
+    return std::nullopt;
+  };
+
+  auto processInstance = [&](hw::InstanceOp inst, PartitionKind kind,
+                             unsigned id) -> LogicalResult {
+    BundleKind direction =
+        kind == PartitionKind::Comb ? BundleKind::CombToSeq
+                                    : BundleKind::SeqToComb;
+    for (auto [idx, result] : llvm::enumerate(inst.getResults())) {
+      DenseMap<unsigned, SmallVector<unsigned>> destInputs;
+      bool allValid = true;
+      for (OpOperand &use : result.getUses()) {
+        auto consumerInst = dyn_cast<hw::InstanceOp>(use.getOwner());
+        if (!consumerInst) {
+          allValid = false;
+          break;
+        }
+        auto classified = classifyInstance(consumerInst.getOperation());
+        if (!classified || classified->first == kind) {
+          allValid = false;
+          break;
+        }
+        destInputs[classified->second].push_back(use.getOperandNumber());
+      }
+      if (!allValid || destInputs.empty())
+        continue;
+
+      SmallVector<unsigned> destIds;
+      destIds.reserve(destInputs.size());
+      for (auto &entry : destInputs)
+        destIds.push_back(entry.first);
+      llvm::sort(destIds);
+
+      SmallVector<DestPortInfo> consumers;
+      consumers.reserve(destIds.size());
+      for (unsigned destId : destIds) {
+        auto &ports = destInputs[destId];
+        llvm::sort(ports);
+        consumers.push_back({destId, ports});
+      }
+
+      BundleSignal signal{static_cast<unsigned>(idx), result.getType(),
+                          std::move(consumers)};
+
+      BundleGroupKey key{direction, id, destIds};
+      auto [it, inserted] = bundleMap.try_emplace(key);
+      BundleInfo &bundle = it->second;
+      if (inserted) {
+        bundle.kind = direction;
+        bundle.sourceId = id;
+        bundle.destIds = destIds;
+        bundle.name = makeBundleName(ctx, direction, id, destIds);
+        bundle.loc = inst.getLoc();
+      }
+      bundle.signals.push_back(std::move(signal));
     }
-    return it->second;
+    return success();
   };
 
   for (const Partition &part : partitions.partitions) {
-    unsigned combId = part.id;
-    hw::InstanceOp combInst = part.combInstance;
-    for (auto [idx, result] : llvm::enumerate(combInst.getResults())) {
-      if (!result.hasOneUse())
-        continue;
-      OpOperand &use = *result.use_begin();
-      auto consumerInst = dyn_cast<hw::InstanceOp>(use.getOwner());
-      if (!consumerInst)
-        continue;
-      auto seqIt = partitions.seqInstanceToId.find(consumerInst.getOperation());
-      if (seqIt == partitions.seqInstanceToId.end())
-        continue;
-      unsigned seqId = seqIt->second;
-      auto &info = getPair(combId, seqId);
-      info.combToSeq.push_back(CombToSeqSignal{
-          static_cast<unsigned>(idx),
-          static_cast<unsigned>(use.getOperandNumber()), result.getType()});
-    }
+    if (failed(processInstance(part.combInstance, PartitionKind::Comb,
+                               part.id)))
+      return failure();
+    if (failed(processInstance(part.seqInstance, PartitionKind::Seq, part.id)))
+      return failure();
   }
 
-  for (const Partition &part : partitions.partitions) {
-    unsigned seqId = part.id;
-    hw::InstanceOp seqInst = part.seqInstance;
-    for (auto [idx, result] : llvm::enumerate(seqInst.getResults())) {
-      if (!result.hasOneUse())
-        continue;
-      OpOperand &use = *result.use_begin();
-      auto consumerInst = dyn_cast<hw::InstanceOp>(use.getOwner());
-      if (!consumerInst)
-        continue;
-      auto combIt =
-          partitions.combInstanceToId.find(consumerInst.getOperation());
-      if (combIt == partitions.combInstanceToId.end())
-        continue;
-      unsigned combId = combIt->second;
-      auto &info = getPair(combId, seqId);
-      info.seqToComb.push_back(SeqToCombSignal{
-          static_cast<unsigned>(idx),
-          static_cast<unsigned>(use.getOperandNumber()), result.getType()});
-    }
+  OpBuilder typeBuilder(ctx);
+  for (auto &entry : bundleMap) {
+    BundleInfo &bundle = entry.second;
+    llvm::sort(bundle.signals,
+               [](const BundleSignal &a, const BundleSignal &b) {
+                 return a.sourcePortIdx < b.sourcePortIdx;
+               });
+    SmallVector<Type> types;
+    types.reserve(bundle.signals.size());
+    for (const auto &signal : bundle.signals)
+      types.push_back(signal.type);
+    auto typeOr = buildBundleType(bundle.loc, types, typeBuilder);
+    if (failed(typeOr))
+      return failure();
+    bundle.type = *typeOr;
+    bundles.push_back(std::move(bundle));
   }
 
-  for (auto &it : pairMap) {
-    PartitionPairInfo &info = it.second;
-    if (info.combToSeq.empty() && info.seqToComb.empty())
-      continue;
-
-    if (!info.combToSeq.empty()) {
-      llvm::sort(info.combToSeq,
-                 [](const CombToSeqSignal &a, const CombToSeqSignal &b) {
-                   return a.combOutputIdx < b.combOutputIdx;
-                 });
-    }
-
-    if (!info.seqToComb.empty()) {
-      llvm::sort(info.seqToComb,
-                 [](const SeqToCombSignal &a, const SeqToCombSignal &b) {
-                   return a.seqOutputIdx < b.seqOutputIdx;
-                 });
-    }
-
-    pairs.push_back(info);
-  }
-
+  llvm::sort(bundles, [](const BundleInfo &a, const BundleInfo &b) {
+    if (a.kind != b.kind)
+      return static_cast<unsigned>(a.kind) < static_cast<unsigned>(b.kind);
+    if (a.sourceId != b.sourceId)
+      return a.sourceId < b.sourceId;
+    return std::lexicographical_compare(a.destIds.begin(), a.destIds.end(),
+                                        b.destIds.begin(), b.destIds.end());
+  });
   return success();
 }
 
 LogicalResult HWAggregateCorvusPortsPass::buildModulePlans(
-    const DiscoveredPartitions &partitions, ArrayRef<PartitionPairInfo> pairs,
+    const DiscoveredPartitions &partitions, ArrayRef<BundleInfo> bundles,
     DenseMap<hw::HWModuleOp, ModuleBundlePlan> &plans) {
   plans.clear();
-  if (pairs.empty())
+  if (bundles.empty())
     return success();
   if (partitions.partitions.empty())
     return success();
 
-  auto sortSpecs = [](auto &specs) {
-    llvm::sort(specs, [](const auto &lhs, const auto &rhs) {
-      if (lhs.endpoint.combId != rhs.endpoint.combId)
-        return lhs.endpoint.combId < rhs.endpoint.combId;
-      if (lhs.endpoint.seqId != rhs.endpoint.seqId)
-        return lhs.endpoint.seqId < rhs.endpoint.seqId;
-      if (lhs.endpoint.kind != rhs.endpoint.kind)
-        return static_cast<unsigned>(lhs.endpoint.kind) <
-               static_cast<unsigned>(rhs.endpoint.kind);
-      return lhs.endpoint.name.getValue() < rhs.endpoint.name.getValue();
+  auto appendSourcePlan = [&](hw::HWModuleOp module, const BundleInfo &bundle) {
+    auto &plan = plans[module];
+    ModuleBundlePlan::OutputBundle output;
+    output.bundle = &bundle;
+    for (const auto &signal : bundle.signals)
+      output.signalOutputPorts.push_back(signal.sourcePortIdx);
+    plan.outputs.push_back(std::move(output));
+  };
+
+  auto appendDestPlan = [&](hw::HWModuleOp module, const BundleInfo &bundle,
+                            unsigned destId) -> LogicalResult {
+    auto &plan = plans[module];
+    ModuleBundlePlan::InputBundle input;
+    input.bundle = &bundle;
+    input.signalInputPorts.resize(bundle.signals.size());
+    for (auto [sigIdx, signal] : llvm::enumerate(bundle.signals)) {
+      auto it = llvm::find_if(signal.consumers,
+                              [&](const DestPortInfo &info) {
+                                return info.destId == destId;
+                              });
+      if (it == signal.consumers.end()) {
+        auto diag =
+            module.emitOpError("missing consumer mapping for bundle ")
+            << bundle.name << " and partition id " << destId;
+        (void)diag;
+        return failure();
+      }
+      input.signalInputPorts[sigIdx] = it->inputPorts;
+      llvm::sort(input.signalInputPorts[sigIdx]);
+    }
+    plan.inputs.push_back(std::move(input));
+    return success();
+  };
+
+  for (const BundleInfo &bundle : bundles) {
+    const Partition &sourcePart = getPartition(partitions, bundle.sourceId);
+    hw::HWModuleOp sourceModule = bundle.kind == BundleKind::CombToSeq
+                                      ? sourcePart.combModule
+                                      : sourcePart.seqModule;
+    appendSourcePlan(sourceModule, bundle);
+
+    for (unsigned destId : bundle.destIds) {
+      const Partition &destPart = getPartition(partitions, destId);
+      hw::HWModuleOp destModule = bundle.kind == BundleKind::CombToSeq
+                                      ? destPart.seqModule
+                                      : destPart.combModule;
+      if (failed(appendDestPlan(destModule, bundle, destId)))
+        return failure();
+    }
+  }
+
+  auto sortBundles = [](auto &bundleVec) {
+    llvm::sort(bundleVec, [](const auto &lhs, const auto &rhs) {
+      return lhs.bundle->name.getValue() < rhs.bundle->name.getValue();
     });
   };
 
-  bool enforceLimit = maxBundleBitWidth != 0;
-  int64_t widthLimit =
-      enforceLimit ? static_cast<int64_t>(maxBundleBitWidth) : 0;
-
-  hw::HWModuleOp sampleModule = partitions.partitions.front().combModule;
-  MLIRContext *ctx = sampleModule.getContext();
-  OpBuilder typeBuilder(ctx);
-  auto makeChunkName = [&](StringAttr base, unsigned idx,
-                           unsigned total) -> StringAttr {
-    if (total <= 1)
-      return base;
-    std::string buffer = base.getValue().str();
-    buffer.push_back('_');
-    buffer += std::to_string(idx);
-    return StringAttr::get(ctx, buffer);
-  };
-
-  for (const PartitionPairInfo &info : pairs) {
-    const Partition &combPart = getPartition(partitions, info.key.combId);
-    const Partition &seqPart = getPartition(partitions, info.key.seqId);
-    hw::HWModuleOp combModule = combPart.combModule;
-    hw::HWModuleOp seqModule = seqPart.seqModule;
-    auto &combPlan = plans[combModule];
-    auto &seqPlan = plans[seqModule];
-
-    if (!info.combToSeq.empty()) {
-      SmallVector<BundleChunkSpec> chunks;
-      if (failed(buildBundleChunks(
-              ArrayRef<CombToSeqSignal>(info.combToSeq), enforceLimit,
-              widthLimit, combModule.getLoc(),
-              [](const CombToSeqSignal &signal) {
-                return signal.combOutputIdx;
-              },
-              [](const CombToSeqSignal &signal) { return signal.seqInputIdx; },
-              chunks)))
-        return failure();
-      unsigned chunkCount = chunks.size();
-      for (auto [chunkIdx, chunk] : llvm::enumerate(chunks)) {
-        auto typeOr = buildBundleType(combModule.getLoc(), chunk.elementTypes,
-                                      typeBuilder);
-        if (failed(typeOr))
-          return failure();
-        BundleEndpoint endpoint{
-            BundleKind::CombToSeq, info.key.combId, info.key.seqId,
-            makeChunkName(info.combToSeqBundleName, chunkIdx, chunkCount),
-            *typeOr};
-
-        OutputBundleSpec combOutput{endpoint};
-        combOutput.portIndices = chunk.producerPorts;
-        combPlan.outputs.push_back(std::move(combOutput));
-
-        InputBundleSpec seqInput{endpoint};
-        seqInput.portIndices = chunk.consumerPorts;
-        seqPlan.inputs.push_back(std::move(seqInput));
-      }
-    }
-
-    if (!info.seqToComb.empty()) {
-      SmallVector<BundleChunkSpec> chunks;
-      if (failed(buildBundleChunks(
-              ArrayRef<SeqToCombSignal>(info.seqToComb), enforceLimit,
-              widthLimit, seqModule.getLoc(),
-              [](const SeqToCombSignal &signal) { return signal.seqOutputIdx; },
-              [](const SeqToCombSignal &signal) { return signal.combInputIdx; },
-              chunks)))
-        return failure();
-      unsigned chunkCount = chunks.size();
-      for (auto [chunkIdx, chunk] : llvm::enumerate(chunks)) {
-        auto typeOr = buildBundleType(seqModule.getLoc(), chunk.elementTypes,
-                                      typeBuilder);
-        if (failed(typeOr))
-          return failure();
-        BundleEndpoint endpoint{
-            BundleKind::SeqToComb, info.key.combId, info.key.seqId,
-            makeChunkName(info.seqToCombBundleName, chunkIdx, chunkCount),
-            *typeOr};
-
-        OutputBundleSpec seqOutput{endpoint};
-        seqOutput.portIndices = chunk.producerPorts;
-        seqPlan.outputs.push_back(std::move(seqOutput));
-
-        InputBundleSpec combInput{endpoint};
-        combInput.portIndices = chunk.consumerPorts;
-        combPlan.inputs.push_back(std::move(combInput));
-      }
-    }
-  }
-
   for (auto &entry : plans) {
-    sortSpecs(entry.second.inputs);
-    sortSpecs(entry.second.outputs);
+    sortBundles(entry.second.inputs);
+    sortBundles(entry.second.outputs);
   }
+
   return success();
 }
 
@@ -808,9 +761,9 @@ HWAggregateCorvusPortsPass::rewriteModule(hw::HWModuleOp module,
       unsigned insertIndex = module.getNumOutputPorts();
       SmallVector<Value> values;
       SmallVector<Type> types;
-      values.reserve(spec.portIndices.size());
-      types.reserve(spec.portIndices.size());
-      for (unsigned idx : spec.portIndices) {
+      values.reserve(spec.signalOutputPorts.size());
+      types.reserve(spec.signalOutputPorts.size());
+      for (unsigned idx : spec.signalOutputPorts) {
         Value val = outputOp.getOperand(idx);
         values.push_back(val);
         types.push_back(val.getType());
@@ -818,41 +771,64 @@ HWAggregateCorvusPortsPass::rewriteModule(hw::HWModuleOp module,
       auto packedOr = packValues(module.getLoc(), builder, values, types);
       if (failed(packedOr))
         return failure();
-      module.appendOutputs({{spec.endpoint.name, *packedOr}});
+      module.appendOutputs({{spec.bundle->name, *packedOr}});
       StringAttr actualName = StringAttr::get(
           module.getContext(), module.getOutputName(insertIndex));
-      outputsToErase.append(spec.portIndices.begin(), spec.portIndices.end());
-      result.appendedOutputs.push_back(
-          {spec.endpoint.kind, spec.endpoint.combId, spec.endpoint.seqId,
-           actualName, spec.endpoint.type, spec.endpoint.name});
+      outputsToErase.append(spec.signalOutputPorts.begin(),
+                            spec.signalOutputPorts.end());
+
+      AppendedPortInfo info;
+      info.kind = spec.bundle->kind;
+      info.sourceId = spec.bundle->sourceId;
+      info.destIds = spec.bundle->destIds;
+      info.name = actualName;
+      info.type = spec.bundle->type;
+      info.bundleName = spec.bundle->name;
+      result.appendedOutputs.push_back(std::move(info));
     }
   }
 
   if (!plan.inputs.empty()) {
+    builder.setInsertionPointToStart(body);
     for (const auto &spec : plan.inputs) {
       auto inserted =
           module.insertInputs(module.getNumInputPorts(),
-                              {{spec.endpoint.name, spec.endpoint.type}});
+                              {{spec.bundle->name, spec.bundle->type}});
       Value aggregate = inserted.front().second;
       StringAttr actualName = inserted.front().first;
-      builder.setInsertionPointToStart(body);
+
+      SmallVector<Value> extracted(spec.bundle->signals.size());
       int64_t offset = 0;
-      for (unsigned idx : spec.portIndices) {
-        BlockArgument arg = body->getArgument(idx);
+      for (auto [sigIdx, signal] : llvm::enumerate(spec.bundle->signals)) {
         auto sliceOr = extractSlice(module.getLoc(), builder, aggregate,
-                                    arg.getType(), offset);
+                                    signal.type, offset);
         if (failed(sliceOr))
           return failure();
-        arg.replaceAllUsesWith(*sliceOr);
-        auto widthOr = getSignalBitWidth(module.getLoc(), arg.getType());
+        auto widthOr = getSignalBitWidth(module.getLoc(), signal.type);
         if (failed(widthOr))
           return failure();
+        auto wire = builder.create<hw::WireOp>(module.getLoc(), *sliceOr);
+        extracted[sigIdx] = wire.getResult();
         offset += *widthOr;
       }
-      inputsToErase.append(spec.portIndices.begin(), spec.portIndices.end());
-      result.appendedInputs.push_back({spec.endpoint.kind, spec.endpoint.combId,
-                                       spec.endpoint.seqId, actualName,
-                                       spec.endpoint.type, spec.endpoint.name});
+
+      for (auto [sigIdx, ports] :
+           llvm::enumerate(spec.signalInputPorts)) {
+        for (unsigned portIdx : ports) {
+          BlockArgument arg = body->getArgument(portIdx);
+          arg.replaceAllUsesWith(extracted[sigIdx]);
+          inputsToErase.push_back(portIdx);
+        }
+      }
+
+      AppendedPortInfo info;
+      info.kind = spec.bundle->kind;
+      info.sourceId = spec.bundle->sourceId;
+      info.destIds = spec.bundle->destIds;
+      info.name = actualName;
+      info.type = spec.bundle->type;
+      info.bundleName = spec.bundle->name;
+      result.appendedInputs.push_back(std::move(info));
     }
   }
 
@@ -889,13 +865,21 @@ LogicalResult HWAggregateCorvusPortsPass::rewriteTopInstances(
   DenseMap<BundleKey, Value> producedBundles;
   DenseMap<BundleKey, SmallVector<Backedge>> pendingBundles;
 
+  auto makeKey = [&](const AppendedPortInfo &endpoint) {
+    BundleKey key;
+    key.kind = endpoint.kind;
+    key.sourceId = endpoint.sourceId;
+    key.destIds = endpoint.destIds;
+    key.bundleName = endpoint.bundleName;
+    return key;
+  };
+
   auto getOperand = [&](const AppendedPortInfo &endpoint) -> Value {
     if (!endpoint.type)
       llvm::report_fatal_error("bundle endpoint missing type");
     if (!endpoint.bundleName)
       llvm::report_fatal_error("bundle endpoint missing identifier");
-    BundleKey key{endpoint.combId, endpoint.seqId, endpoint.kind,
-                  endpoint.bundleName};
+    BundleKey key = makeKey(endpoint);
     if (auto it = producedBundles.find(key); it != producedBundles.end())
       return it->second;
     edgeOpBuilder.setInsertionPointToStart(topModule.getBodyBlock());
@@ -907,8 +891,7 @@ LogicalResult HWAggregateCorvusPortsPass::rewriteTopInstances(
   auto recordOutput = [&](const AppendedPortInfo &endpoint, Value value) {
     if (!endpoint.bundleName)
       llvm::report_fatal_error("bundle endpoint missing identifier");
-    BundleKey key{endpoint.combId, endpoint.seqId, endpoint.kind,
-                  endpoint.bundleName};
+    BundleKey key = makeKey(endpoint);
     producedBundles[key] = value;
     if (auto it = pendingBundles.find(key); it != pendingBundles.end()) {
       for (Backedge edge : it->second)
@@ -1006,11 +989,16 @@ LogicalResult HWAggregateCorvusPortsPass::rewriteTopInstances(
         topModule.emitOpError("failed to wire all aggregated corvus bundles");
     for (const auto &it : pendingBundles) {
       const BundleKey &key = it.first;
+      std::string destStr;
+      llvm::raw_string_ostream os(destStr);
+      llvm::interleaveComma(
+          key.destIds, os,
+          [&](unsigned destId) { os << "P" << destId; });
       diag.attachNote() << "missing producer for "
                         << (key.kind == BundleKind::CombToSeq ? "comb->seq"
                                                               : "seq->comb")
-                        << " bundle between P" << key.combId << " and P"
-                        << key.seqId << " (" << key.bundleName << ")";
+                        << " bundle from P" << key.sourceId << " to " << destStr
+                        << " (" << key.bundleName << ")";
     }
     return failure();
   }

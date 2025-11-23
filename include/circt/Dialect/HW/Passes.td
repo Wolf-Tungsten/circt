@@ -289,15 +289,15 @@ def HWFlattenCorvusTop : Pass<"hw-flatten-corvus-top", "mlir::ModuleOp"> {
 
 def HWAggregateCorvusPorts
     : Pass<"hw-aggregate-corvus-ports", "mlir::ModuleOp"> {
-  let summary = "Bundle direct corvus_seq_P*/corvus_comb_P* connections";
+  let summary = "Bundle corvus_seq_P*/corvus_comb_P* connections, including fan-out";
   let description = [{
     This pass scans `corvus_top` for partitioned `corvus_seq_P*` and
-    `corvus_comb_P*` instances that exchange signals exclusively with their
-    matching partition. Such one-to-one connections are replaced with a single
-    aggregated bundle port per direction by concatenating the producer signals
-    and extracting them inside the consumer. Instance operands and results are
-    updated accordingly so the behavior is preserved while significantly
-    reducing the inter-partition port count.
+    `corvus_comb_P*` instances that exchange signals directly with partitions
+    of the opposite kind. All signals driven by the same source partition and
+    consumed by a (potentially multi-element) set of destination partitions are
+    concatenated into a single bundle port on the source and fanned out to each
+    destination. Consumers immediately extract their pieces from the bundle,
+    keeping partition interfaces compact while preserving behaviour.
   }];
   let dependentDialects = ["comb::CombDialect"];
   let options = [
@@ -308,9 +308,7 @@ def HWAggregateCorvusPorts
            "Prefix used to identify sequential partition module names">,
     Option<"combPartitionPrefix", "comb-partition-prefix", "std::string",
            "\"corvus_comb_P\"",
-           "Prefix used to identify combinational partition module names">,
-    Option<"maxBundleBitWidth", "max-bundle-bitwidth", "unsigned", "1024",
-           "Maximum width in bits allowed for an aggregated bundle port before it is split">
+           "Prefix used to identify combinational partition module names">
   ];
 }
 
