@@ -60,29 +60,34 @@ module {
 
 // CHECK-LABEL: hw.module private @corvus_seq_P0
 // CHECK-SAME: in %clk : i1
-// CHECK-SAME: in %C0_to_S0_1_bundle : i5
+// CHECK-SAME: in %C0_to_S0_1_bundle : i35
 // CHECK-SAME: out seq_passthru : i1
-// CHECK-SAME: out S0_to_C0_1_bundle : i5
-// CHECK: hw.wire
+// CHECK-SAME: out S0_to_C0_1_bundle : i35
+// CHECK: hw.wire %{{.*}} sym @C0_to_S0_1_bundle_slice0_sym0
+// CHECK: hw.wire %{{.*}} sym @C0_to_S0_1_bundle_slice1_sym1
 // CHECK: comb.extract %C0_to_S0_1_bundle from 0
-// CHECK: comb.extract %C0_to_S0_1_bundle from 2
+// CHECK: comb.extract %C0_to_S0_1_bundle from 32
+// CHECK: hw.constant 0 : i30
 // CHECK: comb.concat
 
 // CHECK-LABEL: hw.module private @corvus_seq_P1
-// CHECK-SAME: in %C0_to_S0_1_bundle : i5
+// CHECK-SAME: in %C0_to_S0_1_bundle : i35
 // CHECK: comb.extract %C0_to_S0_1_bundle from 0
+// CHECK: comb.extract %C0_to_S0_1_bundle from 32
 
 // CHECK-LABEL: hw.module private @corvus_comb_P0
-// CHECK-SAME: in %S0_to_C0_1_bundle : i5
+// CHECK-SAME: in %S0_to_C0_1_bundle : i35
 // CHECK-SAME: out comb_top : i1
-// CHECK-SAME: out C0_to_S0_1_bundle : i5
+// CHECK-SAME: out C0_to_S0_1_bundle : i35
 // CHECK: comb.extract %S0_to_C0_1_bundle from 0
-// CHECK: comb.extract %S0_to_C0_1_bundle from 2
+// CHECK: comb.extract %S0_to_C0_1_bundle from 32
+// CHECK: hw.constant 0 : i30
 // CHECK: comb.concat
 
 // CHECK-LABEL: hw.module private @corvus_comb_P1
-// CHECK-SAME: in %S0_to_C0_1_bundle : i5
+// CHECK-SAME: in %S0_to_C0_1_bundle : i35
 // CHECK: comb.extract %S0_to_C0_1_bundle from 0
+// CHECK: comb.extract %S0_to_C0_1_bundle from 32
 
 // CHECK-LABEL: hw.module @corvus_top
 // CHECK: %[[COMB0_TOP:.*]], %[[C_TO_S:.*]] = hw.instance "__comb0" @corvus_comb_P0

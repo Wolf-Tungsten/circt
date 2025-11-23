@@ -91,3 +91,9 @@ circt-opt corvus.mlir \
 
 The lit test `test/Dialect/HW/hw-aggregate-corvus-ports.mlir` provides concrete
 examples of how the pass rewrites modules and instances.
+
+## 访存对齐的合并
+
+- 合并后的每个信号低位都从 32 位对齐的位置开始。为此，打包时会在信号之间插入零填充，使下一个信号的起始偏移对齐到 32 的整数倍。
+- 消费端按照同样的偏移从 bundle 中 extract，并立刻通过 `hw.wire` 固化切片，避免重复的 extract。
+- 这样的布局保证了对齐要求，不改变信号的语义，并保持 concat/extract 的确定性。

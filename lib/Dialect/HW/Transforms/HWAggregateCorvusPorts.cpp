@@ -32,6 +32,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <limits>
@@ -103,6 +104,7 @@ struct BundleInfo {
   StringAttr name;
   LocationAttr loc;
   Type type;
+  SmallVector<int64_t> offsets;
 };
 
 struct ModuleBundlePlan {
@@ -281,15 +283,30 @@ static std::optional<unsigned> parsePartitionId(StringRef name,
   return value;
 }
 
-static FailureOr<Type> buildBundleType(Location loc, ArrayRef<Type> types,
-                                       OpBuilder &builder) {
+struct BundleLayout {
+  SmallVector<int64_t> offsets;
   int64_t totalWidth = 0;
+};
+
+static FailureOr<BundleLayout> computeAlignedLayout(Location loc,
+                                                    ArrayRef<Type> types,
+                                                    unsigned alignBits) {
+  BundleLayout layout;
+  int64_t current = 0;
   for (Type type : types) {
     auto widthOr = getSignalBitWidth(loc, type);
     if (failed(widthOr))
       return failure();
-    totalWidth += *widthOr;
+    current = llvm::alignTo(current, static_cast<uint64_t>(alignBits));
+    layout.offsets.push_back(current);
+    current += *widthOr;
   }
+  layout.totalWidth = current;
+  return layout;
+}
+
+static FailureOr<Type> buildBundleType(Location loc, int64_t totalWidth,
+                                       OpBuilder &builder) {
   if (totalWidth <= 0)
     return emitError(loc) << "bundle width must be greater than zero";
   if (totalWidth > IntegerType::kMaxWidth)
@@ -316,15 +333,25 @@ computeOldToNewMapping(unsigned oldCount, ArrayRef<unsigned> removed) {
   return mapping;
 }
 
-static FailureOr<Value> packValues(Location loc, OpBuilder &builder,
-                                   ArrayRef<Value> values,
-                                   ArrayRef<Type> originalTypes) {
+static FailureOr<Value>
+packValues(Location loc, OpBuilder &builder, ArrayRef<Value> values,
+           ArrayRef<Type> originalTypes, ArrayRef<int64_t> offsets,
+           int64_t totalWidth) {
+  assert(values.size() == originalTypes.size() &&
+         "expected values and types to align");
+  assert(values.size() == offsets.size() &&
+         "expected offsets to align with values");
+  assert(totalWidth > 0 && "expected positive bundle width");
+
   SmallVector<Value> intValues;
   intValues.reserve(values.size());
+  SmallVector<int64_t> widths;
+  widths.reserve(values.size());
   for (auto [val, type] : llvm::zip(values, originalTypes)) {
     auto widthOr = getSignalBitWidth(loc, type);
     if (failed(widthOr))
       return failure();
+    widths.push_back(*widthOr);
     auto castedOr =
         castValueToInteger(loc, builder, val, static_cast<unsigned>(*widthOr));
     if (failed(castedOr))
@@ -334,10 +361,37 @@ static FailureOr<Value> packValues(Location loc, OpBuilder &builder,
 
   if (intValues.empty())
     return Value();
-  if (intValues.size() == 1)
-    return intValues.front();
 
-  SmallVector<Value> msbFirst(intValues.rbegin(), intValues.rend());
+  SmallVector<Value> segments;
+  int64_t current = 0;
+  for (auto [idx, intVal] : llvm::enumerate(intValues)) {
+    int64_t gap = offsets[idx] - current;
+    if (gap < 0)
+      return emitError(loc) << "computed negative padding for bundle packing";
+    if (gap > 0) {
+      auto zeroTy = builder.getIntegerType(static_cast<unsigned>(gap));
+      segments.push_back(
+          builder.create<hw::ConstantOp>(loc, zeroTy, 0).getResult());
+      current += gap;
+    }
+    segments.push_back(intVal);
+    current += widths[idx];
+  }
+  if (current != totalWidth && totalWidth != 0) {
+    if (current < totalWidth) {
+      auto zeroTy =
+          builder.getIntegerType(static_cast<unsigned>(totalWidth - current));
+      segments.push_back(
+          builder.create<hw::ConstantOp>(loc, zeroTy, 0).getResult());
+    } else {
+      return emitError(loc) << "bundle packing exceeded expected width";
+    }
+  }
+
+  if (segments.size() == 1)
+    return segments.front();
+
+  SmallVector<Value> msbFirst(segments.rbegin(), segments.rend());
   return builder.create<comb::ConcatOp>(loc, msbFirst).getResult();
 }
 
@@ -417,7 +471,7 @@ void HWAggregateCorvusPortsPass::runOnOperation() {
   if (partitions.partitions.empty())
     return;
 
-  SmallVector<BundleInfo> bundles;
+  SmallVector<BundleInfo, 0> bundles;
   if (failed(collectBundles(partitions, bundles))) {
     signalPassFailure();
     return;
@@ -645,7 +699,12 @@ LogicalResult HWAggregateCorvusPortsPass::collectBundles(
     types.reserve(bundle.signals.size());
     for (const auto &signal : bundle.signals)
       types.push_back(signal.type);
-    auto typeOr = buildBundleType(bundle.loc, types, typeBuilder);
+    auto layoutOr = computeAlignedLayout(bundle.loc, types, 32);
+    if (failed(layoutOr))
+      return failure();
+    bundle.offsets = layoutOr->offsets;
+    auto typeOr =
+        buildBundleType(bundle.loc, layoutOr->totalWidth, typeBuilder);
     if (failed(typeOr))
       return failure();
     bundle.type = *typeOr;
@@ -761,14 +820,19 @@ HWAggregateCorvusPortsPass::rewriteModule(hw::HWModuleOp module,
       unsigned insertIndex = module.getNumOutputPorts();
       SmallVector<Value> values;
       SmallVector<Type> types;
+      SmallVector<int64_t> offsets;
       values.reserve(spec.signalOutputPorts.size());
       types.reserve(spec.signalOutputPorts.size());
+      offsets.reserve(spec.signalOutputPorts.size());
       for (unsigned idx : spec.signalOutputPorts) {
         Value val = outputOp.getOperand(idx);
         values.push_back(val);
         types.push_back(val.getType());
+        offsets.push_back(spec.bundle->offsets[values.size() - 1]);
       }
-      auto packedOr = packValues(module.getLoc(), builder, values, types);
+      auto bundleIntTy = cast<IntegerType>(spec.bundle->type);
+      auto packedOr = packValues(module.getLoc(), builder, values, types,
+                                 offsets, bundleIntTy.getWidth());
       if (failed(packedOr))
         return failure();
       module.appendOutputs({{spec.bundle->name, *packedOr}});
@@ -798,16 +862,8 @@ HWAggregateCorvusPortsPass::rewriteModule(hw::HWModuleOp module,
       Value aggregate = inserted.front().second;
       StringAttr actualName = inserted.front().first;
 
-      SmallVector<int64_t> offsets;
-      offsets.reserve(spec.bundle->signals.size());
-      int64_t offset = 0;
-      for (const auto &signal : spec.bundle->signals) {
-        offsets.push_back(offset);
-        auto widthOr = getSignalBitWidth(module.getLoc(), signal.type);
-        if (failed(widthOr))
-          return failure();
-        offset += *widthOr;
-      }
+      SmallVector<int64_t> offsets(spec.bundle->offsets.begin(),
+                                   spec.bundle->offsets.end());
 
       SmallVector<Value> extracted(spec.bundle->signals.size());
       auto getWire = [&](unsigned sigIdx) -> FailureOr<Value> {
