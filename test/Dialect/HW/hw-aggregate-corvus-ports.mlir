@@ -63,10 +63,10 @@ module {
 // CHECK-SAME: in %C0_to_S0_1_bundle : i35
 // CHECK-SAME: out seq_passthru : i1
 // CHECK-SAME: out S0_to_C0_1_bundle : i35
-// CHECK: hw.wire %{{.*}} sym @C0_to_S0_1_bundle_slice0_sym0
-// CHECK: hw.wire %{{.*}} sym @C0_to_S0_1_bundle_slice1_sym1
 // CHECK: comb.extract %C0_to_S0_1_bundle from 0
+// CHECK: hw.wire %{{.*}} sym @C0_to_S0_1_bundle_slice0_sym0
 // CHECK: comb.extract %C0_to_S0_1_bundle from 32
+// CHECK: hw.wire %{{.*}} sym @C0_to_S0_1_bundle_slice1_sym1
 // CHECK: hw.constant 0 : i30
 // CHECK: comb.concat
 
