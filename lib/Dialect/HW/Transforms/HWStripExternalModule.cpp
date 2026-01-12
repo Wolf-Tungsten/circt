@@ -187,6 +187,14 @@ void HWStripExternalModule::runOnOperation() {
     binds.push_back(bindOp);
   for (auto bindOp : binds)
     bindOp.erase();
+
+  // After binds are erased, any extracted test-code instances marked
+  // `doNotPrint` would be dropped by ExportVerilog. Clear the marker so the
+  // direct instantiations remain in the emitted Verilog.
+  mlirModuleOp.walk([](hw::InstanceOp inst) {
+    if (inst.getDoNotPrint())
+      inst->removeAttr("doNotPrint");
+  });
 }
 
 LogicalResult
