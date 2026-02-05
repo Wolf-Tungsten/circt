@@ -7,6 +7,23 @@ add_circt_dialect_library(CIRCTHWTransforms
   VerifyInnerRefNamespace.cpp
   FlattenModules.cpp
   FooWires.cpp
+  HWEliminateHierPath.cpp
+  HWPrintStateElemDist.cpp
+  HWStripExternalModule.cpp
+  HWReduceMemReadLatency.cpp
+  HWAssignUniqueInnerSym.cpp
+  HWAssignUniqueID.cpp
+  HWInsertWires.cpp
+  HWInsertPartitionWires.cpp
+  HWSplitSeqComb.cpp
+  HWAggregateCorvusPorts.cpp
+  HWFlattenCorvusTop.cpp
+  HWFixXMRRef.cpp
+  HWGlobalUniqueInnerSym.cpp
+  HWCombmemToReg.cpp
+  HWRepCut.cpp
+  HWPartitionModules.cpp
+  HWAnalysis.cpp
 
   DEPENDS
   CIRCTHWTransformsIncGen

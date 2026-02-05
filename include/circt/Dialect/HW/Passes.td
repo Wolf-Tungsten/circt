@@ -92,4 +92,229 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let dependentDialects = ["comb::CombDialect"];
 }
 
+def HWEliminateHierPath : Pass<"hw-eliminate-hierpath", "mlir::ModuleOp"> {
+  let summary = "Eliminate hw.hierpath operations";
+  let description = [{
+    This pass eliminates `hw.hierpath` operations by adding path into the
+    module ports and replacing the sv.xmr operations with simple wire.
+  }];
+}
+
+def HWPrintStateElemDist: Pass<"hw-print-state-elem-dist", "mlir::ModuleOp"> {
+  let summary = "Print the distribution of state elements in CSV style";
+  let description = [{
+    This pass prints the distribution of state elements in a CSV format.
+  }];
+}
+
+def HWStripExternalModule: Pass<"hw-strip-external-module", "mlir::ModuleOp"> {
+  let summary = "Strip external module references";
+  let description = [{
+    This pass splits the single public `hw.module` into private implementation
+    modules `corvus_top` and `corvus_external`, plus a public wrapper that
+    keeps the original module name while instantiating the two private modules.
+  }];
+}
+
+def HWReduceMemReadLatency : Pass<"hw-reduce-mem-read-latency", "mlir::ModuleOp"> {
+  let summary = "Reduce FirMem read latency with extra FirReg";
+  let description = [{
+    This pass reduce `seq.firmem` with readLatency > N to N with extra `seq.firreg`.
+  }];
+  let options = [
+    Option<"latency", "latency", "uint32_t", "1",
+      "Target read latency (default: 1)">
+  ];
+}
+
+def HWAssignUniqueInnerSym : Pass<"hw-assign-unique-inner-sym", "mlir::ModuleOp"> {
+  let summary = "Assign unique InnerSym for firreg and firmem ports";
+  let description = [{
+    This pass add unique InnerSym for all `seq::FirRegOp`, `seq::FirMemReadOp`,
+    `seq::FirMemWriteOp` and `seq::FirMemReadWriteOp` in a module.
+  }];
+}
+
+def HWAssignUniqueID : Pass<"hw-assign-unique-id", "mlir::ModuleOp"> {
+  let summary = "Assign unique ID for firreg and firmem ports";
+  let description = [{
+    This pass add unique ID for all `seq::FirRegOp`, `seq::FirMemReadOp`,
+    `seq::FirMemWriteOp` and `seq::FirMemReadWriteOp` in a module.
+  }];
+}
+
+def HWInsertWires : Pass<"hw-insert-wires", "hw::HWModuleOp"> {
+  let summary = "Insert wires for direct connections between module ports and seq operations";
+  let description = [{
+    This pass inserts hw.wire operations between direct connections involving:
+    - hw.module IOs and seq register/memory operations
+    - Direct connections between seq register/memory operations
+
+    The target operations are seq::FirRegOp, seq::FirMemReadOp, 
+    seq::FirMemWriteOp, and seq::FirMemReadWriteOp.
+  }];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "",
+           "Only run on hw.module operations whose name matches this string">
+  ];
+}
+
+def HWInsertPartitionWires : Pass<"hw-insert-partition-wires", "hw::HWModuleOp"> {
+  let summary = "Insert wires for seq boundary operands grouped by partition";
+  let description = [{
+    This pass inserts hw.wire operations between operations that drive
+    seq boundary ops (FirReg/FirMem*/Output). For every operand of such an op,
+    the pass looks at the op's hw.repcut_partitions attribute and ensures there
+    is exactly one wire between the defining operation and the boundary op per
+    (defining operation, partition set) combination. This preserves distinct
+    SSA edges for later per-partition cloning.
+  }];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "",
+           "Only run on hw.module operations whose name matches this string">
+  ];
+}
+
+def HWSplitSeqComb : Pass<"hw-split-seq-comb", "mlir::ModuleOp"> {
+  let summary = "Split flattened module into sequential S and combinational C modules";
+  let description = [{
+    Duplicate the flattened hw.module into S and C. Keep hw.constant in both.
+    In S: keep only seq ops (FirRegOp/FirMem*), replace their non-constant operands
+    with new inputs, and export their results as outputs. Remove non-seq/non-const ops.
+    In C: add outputs for values that feed seq op operands (non-const), add inputs for
+    seq op results and replace uses, then erase seq ops. The original module is erased.
+  }];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "\"corvus_top\"",
+      "Only split the hw.module whose name matches this string (default: corvus_top)">
+  ];
+}
+
+def HWFixXMRRef : Pass<"hw-fix-xmr-ref", "mlir::ModuleOp"> {
+  let summary = "Resolve sv.xmrref and eliminate unused hw.hierpath ops after flatten";
+  let description = [{
+    After module flattening and global inner symbol uniquification, each
+    `sv.xmrref` should reference a `hw.hierpath` whose last element resolves
+    directly to a unique target operation (e.g. `hw.wire`). This pass:
+      * Replaces `sv.xmrref` users (optionally wrapped in `sv.read_inout`) with
+        the referenced value.
+      * Deletes the `sv.xmrref` (and enclosing `sv.read_inout` if it becomes
+        dead).
+      * Removes any `hw.hierpath` ops left with zero references.
+    This reduces IR noise and prevents verify failures from dangling
+    hierpaths.
+  }];
+}
+
+def HWGlobalUniqueInnerSym : Pass<"hw-global-unique-inner-sym", "mlir::ModuleOp"> {
+  let summary = "Ensure all op inner_syms are globally unique across the ModuleOp";
+  let description = [{
+    This pass scans every Op with InnerSymbolOpInterface that has an `inner_sym` attribute and rewrites
+    duplicate inner symbol names to a unique variant.  Uniqueness is enforced across
+    the whole top-level `mlir::ModuleOp`, not just per `hw.module`.  Any attribute
+    (e.g. `hw.hierpath`) that references an affected inner symbol through an
+    `InnerRefAttr` is updated to point at the new name.
+  }];
+}
+
+def HWCombmemToReg : Pass<"hw-combmem-to-reg", "mlir::ModuleOp"> {
+  let summary = "Convert combmem to register";
+  let description = [{
+    This pass convert firmem with readLatency=0 and related read/write operations to firreg
+  }];
+  let dependentDialects = ["comb::CombDialect"];
+}
+
+def HWRepCut : Pass<"hw-repcut", "hw::HWModuleOp"> {
+  let summary = "RepCut algorithm for replication-aided graph partitioning";
+  let description = [{
+    This pass implements the RepCut algorithm for partitioning hardware designs
+    with replication-aided graph partitioning. The algorithm:
+    1. Builds a dependency graph from MLIR operations
+    2. Creates cones (trees) from sink nodes backwards to register boundaries
+    3. Groups nodes into pieces based on shared cone membership  
+    4. Builds an intersection hypergraph with sink pieces as vertices and 
+       non-sink pieces as hyperedges
+    5. Uses KaHyPar to partition the hypergraph
+    6. Assigns partition IDs to each operation as "hw.repcut_partitions"
+       attribute
+    
+    Operations may belong to multiple partitions due to replication.
+    Requires KaHyPar external tool to be available in PATH.
+  }];
+  let options = [
+    Option<"numPartitions", "num-partitions", "unsigned", "2",
+      "Number of partitions to create (default: 2)">,
+    Option<"moduleName", "module-name", "std::string", "",
+      "Only run on hw.module operations whose name matches this string">
+  ];
+  let dependentDialects = ["seq::SeqDialect", "comb::CombDialect"];
+}
+
+def HWPartitionModules : Pass<"hw-partition-modules", "mlir::ModuleOp"> {
+  let summary = "Partition a module into clones based on hw.repcut_partitions attribute";
+  let description = [{
+    This pass clones the `hw.module` identified by `--module-name` for every
+    partition ID recorded in `hw.repcut_partitions` attributes. Each clone keeps
+    only the operations assigned to its partition and erases unused ports. The
+    original module is rewritten into a wrapper that instantiates all clones and
+    reconnects their interfaces purely through SSA values. Modules without
+    partition annotations are left untouched.
+  }];
+  let dependentDialects = ["seq::SeqDialect", "comb::CombDialect"];
+  let options = [
+    Option<"moduleName", "module-name", "std::string", "",
+           "Name of the hw.module to partition (required)">
+  ];
+}
+
+def HWFlattenCorvusTop : Pass<"hw-flatten-corvus-top", "mlir::ModuleOp"> {
+  let summary = "Inline corvus_seq/corvus_comb partition wrappers into corvus_top";
+  let description = [{
+    This pass erases the intermediate `corvus_seq` and `corvus_comb`
+    wrappers instantiated by `corvus_top` by cloning the partitioned `_P*`
+    instances they contain directly into `corvus_top`. The top-level module
+    retains its original interface and afterwards only contains `hw.instance`
+    operations that instantiate the partition clones.
+  }];
+  let options = [
+    Option<"topModuleName", "top-module-name", "std::string", "\"corvus_top\"",
+           "Name of the hw.module whose wrapper instances should be flattened">,
+    Option<"seqWrapperName", "seq-wrapper-name", "std::string", "\"corvus_seq\"",
+           "Name of the sequential wrapper module to inline when instantiated under the top module">,
+    Option<"combWrapperName", "comb-wrapper-name", "std::string", "\"corvus_comb\"",
+           "Name of the combinational wrapper module to inline when instantiated under the top module">
+  ];
+}
+
+def HWAggregateCorvusPorts
+    : Pass<"hw-aggregate-corvus-ports", "mlir::ModuleOp"> {
+  let summary = "Bundle corvus_seq_P*/corvus_comb_P* connections, including fan-out";
+  let description = [{
+    This pass scans `corvus_top` for partitioned `corvus_seq_P*` and
+    `corvus_comb_P*` instances that exchange signals directly with partitions
+    of the opposite kind. All signals driven by the same source partition and
+    consumed by a (potentially multi-element) set of destination partitions are
+    concatenated into a single bundle port on the source and fanned out to each
+    destination. Consumers immediately extract their pieces from the bundle,
+    keeping partition interfaces compact while preserving behaviour.
+  }];
+  let dependentDialects = ["comb::CombDialect"];
+  let options = [
+    Option<"topModuleName", "top-module-name", "std::string", "\"corvus_top\"",
+           "Name of the hw.module that instantiates the partition clones">,
+    Option<"seqPartitionPrefix", "seq-partition-prefix", "std::string",
+           "\"corvus_seq_P\"",
+           "Prefix used to identify sequential partition module names">,
+    Option<"combPartitionPrefix", "comb-partition-prefix", "std::string",
+           "\"corvus_comb_P\"",
+           "Prefix used to identify combinational partition module names">
+  ];
+}
+
+def HWAnalysis : Pass<"hw-analysis", "mlir::ModuleOp">{
+  let summary = "analysis XiangShan";
+  let description = [{This pass analysis operation count}];
+} 
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD
