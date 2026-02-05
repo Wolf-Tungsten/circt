@@ -312,4 +312,9 @@ def HWAggregateCorvusPorts
   ];
 }
 
+def HWAnalysis : Pass<"hw-analysis", "mlir::ModuleOp">{
+  let summary = "analysis XiangShan";
+  let description = [{This pass analysis operation count}];
+} 
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD

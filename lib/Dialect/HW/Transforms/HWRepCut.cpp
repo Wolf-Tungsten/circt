@@ -30,6 +30,8 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <filesystem>
+#include <thread>
 
 #define DEBUG_TYPE "hw-repcut"
 
@@ -96,9 +98,12 @@ public:
   std::vector<Operation *> idToOp;
   std::set<NodeID> validNodes;
   std::set<NodeID> sinkNodes; // nodes with no outgoing edges
+  std::set<NodeID> explicitSinkNodes;
 
   // Build dependency graph from MLIR operations
   void buildStatementGraph(hw::HWModuleOp moduleOp) {
+    explicitSinkNodes.clear();
+
     // Create edges based on operand dependencies
     moduleOp.walk([&](Operation *op) {
       if (isIgnoreOp(op))
@@ -117,6 +122,15 @@ public:
             addEdge(defOp, op); // normal connect
           }
         }
+      }
+    });
+
+    moduleOp.walk([&](hw::OutputOp outputOp) {
+      for (Value operand : outputOp.getOperands()) {
+        Operation *defOp = operand.getDefiningOp();
+        if (!defOp)
+          continue;
+        explicitSinkNodes.insert(addNode(defOp));
       }
     });
   }
@@ -155,7 +169,7 @@ public:
   }
 
   bool isSinkOp(Operation *op) const {
-    return isa<seq::FirRegOp, seq::FirMemOp, hw::OutputOp>(op);
+    return isa<seq::FirRegOp, seq::FirMemOp>(op);
   }
 
   bool isSinkID(NodeID id) const { return isSinkOp(idToOp[id]); }
@@ -166,7 +180,9 @@ public:
 
   bool isUpperBoundID(NodeID id) const { return isUpperBoundOp(idToOp[id]); }
 
-  bool isIgnoreOp(Operation *op) const { return llvm::isa<hw::HWModuleOp>(op); }
+  bool isIgnoreOp(Operation *op) const {
+    return llvm::isa<hw::HWModuleOp, hw::OutputOp>(op);
+  }
 
   bool isSinkNode(NodeID id) const {
     return outNeigh[id].empty() || isSinkID(id);
@@ -174,6 +190,7 @@ public:
 
   void identifySinkNodes() {
     sinkNodes.clear();
+    sinkNodes.insert(explicitSinkNodes.begin(), explicitSinkNodes.end());
     for (NodeID id : validNodes) {
       if (isSinkNode(id)) {
         sinkNodes.insert(id);
@@ -720,33 +737,79 @@ private:
     file.close();
   }
 
+  std::string findMtKaHyParOutput(const std::string &folder,
+                                const std::string &inputFile) {
+  namespace fs = std::filesystem;
+  fs::path inPath(inputFile);
+  std::string base = inPath.filename().string();
+
+  std::string best;
+  fs::file_time_type bestTime;
+
+    for (auto &p : fs::directory_iterator(folder)) {
+      if (!p.is_regular_file())
+        continue;
+      std::string name = p.path().filename().string();
+      if (name.find(base) == std::string::npos)
+        continue;
+      if (name.find(".part") == std::string::npos)
+        continue;
+
+      auto t = fs::last_write_time(p.path());
+      if (best.empty() || t > bestTime) {
+        best = p.path().string();
+        bestTime = t;
+      }
+    }
+    return best;
+  }
+
   // Run KaHyPar external tool
   bool runKaHyPar(const std::string &inputFile, unsigned k,
                   std::vector<NodeID> &partitionAssignment) {
+    unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+    std::string exe = "/nfs/home/wujiaxing/mt-kahypar/build/mt-kahypar/application/MtKaHyPar";
+    std::string outFolder = "/tmp";
+
     // Create config file
     std::string configFile = "/tmp/kahypar.config";
     writeKaHyParConfig(configFile);
 
     // Build command
-    std::vector<std::string> args = {
-        "KaHyPar", "-h",       inputFile, "-k",          std::to_string(k),
-        "-e",      "0.015", // imbalance factor
-        "-p",      configFile, "--seed",  "-1",          "-w",
-        "true",    "--mode",   "direct",  "--objective", "km1"};
+    // std::vector<std::string> args = {
+    //     "KaHyPar", "-h",       inputFile, "-k",          std::to_string(k),
+    //     "-e",      "0.015", // imbalance factor
+    //     "-p",      configFile, "--seed",  "-1",          "-w",
+    //     "true",    "--mode",   "direct",  "--objective", "km1"};
 
     // Execute KaHyPar
-    std::string outputFile = inputFile + ".part" + std::to_string(k) +
-                             ".epsilon0.015.seed-1.KaHyPar";
+    //std::string outputFile = inputFile + ".part" + std::to_string(k) +
+    //                         ".epsilon0.015.seed-1.KaHyPar";
 
     // For now, use system() call - in production should use proper process
     // execution
-    std::string cmd = "KaHyPar -h " + inputFile + " -k " + std::to_string(k) +
-                      " -e 0.015 -p " + configFile + " --seed -1 -w true " +
-                      "--mode direct --objective km1";
+    // std::string cmd = "KaHyPar -h " + inputFile + " -k " + std::to_string(k) +
+    //                   " -e 0.015 -p " + configFile + " --seed -1 -w true " +
+    //                   "--mode direct --objective km1";
+    std::string cmd =
+    exe + " -h " + inputFile +
+    " --preset-type=default" +
+    " -t " + std::to_string(threads) +
+    " -k " + std::to_string(k) +
+    " -e 0.015" +
+    " -o km1" +
+    " --write-partition-file=true" +
+    " --partition-output-folder=" + outFolder;
 
     int result = system(cmd.c_str());
     if (result != 0) {
       llvm::errs() << "KaHyPar execution failed\n";
+      return false;
+    }
+
+    std::string outputFile = findMtKaHyParOutput(outFolder, inputFile);
+    if (outputFile.empty()) {
+      llvm::errs() << "Failed to locate MtKaHyPar output file\n";
       return false;
     }
 

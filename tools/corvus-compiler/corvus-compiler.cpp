@@ -93,6 +93,11 @@ cl::list<std::string> inputAnnotationFilenames(
     "annotation-file", cl::desc("Optional input annotation file"),
     cl::CommaSeparated, cl::value_desc("filename"), cl::cat(mainCategory));
 
+cl::opt<std::string>
+    repcutMlirOutFile("output-repcut-mlir",
+              cl::desc("Optional file name to output the MLIR after RepCut pass"),
+              cl::init(""), cl::value_desc("filename"), cl::cat(mainCategory));
+
 enum OutputFormatKind {
   OutputIRHW,
   OutputVerilog,
@@ -739,6 +744,7 @@ LogicalResult processBuffer(
     flattenOptions.seqWrapperName = "corvus_seq";
     flattenOptions.combWrapperName = "corvus_comb";
     pm.addPass(hw::createHWFlattenCorvusTop(flattenOptions));
+    //pm.addPass(hw::createHWAnalysisPass());
     //hw::HWAggregateCorvusPortsOptions aggregateOptions;
     //aggregateOptions.topModuleName = "corvus_top";
     //aggregateOptions.seqPartitionPrefix = "corvus_seq_P";
